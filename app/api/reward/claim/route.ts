@@ -1,15 +1,19 @@
 import { NextResponse } from 'next/server'
-import { createClient } from '@supabase/supabase-js'
+import { supabaseAdmin } from '../../../../lib/supabaseAdmin'
+import {
+  accrueRewardsForUserStakes,
+  type StakeRow,
+} from '../../../../lib/rewardEngine'
 
 export const dynamic = 'force-dynamic'
 
-// ---------------- Supabase client ----------------
+// ---------------- Config / Constants ----------------
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!
-const supabaseKey =
-  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
-
-const supabase = createClient(supabaseUrl, supabaseKey)
+const MIN_STAKE_FOR_NFT = 5_000_000 // شرط NFT
+const NFT_BOOST_APR = 20 // +20% APR
+const APR_CAP = 120 // سقف کل APR
+const DAILY_XP = 25 // XP روزانه برای Claim
+const CLAIM_FEE_RATE = 0.02 // 2% Claim Fee روی پاداش
 
 // ---------------- Types ----------------
 
@@ -23,70 +27,49 @@ type UserRow = {
   last_daily_claim: string | null
 }
 
-type StakeRow = {
-  id: string
-  user_id: string
-  staked_amount: number
-  apr_base: number | null
-  started_at: string
-  unlock_at: string | null
-  status: 'active' | 'pending_unstake' | 'unlocking' | 'unlocked' | 'withdrawn' | null
-  last_reward_at: string | null
-  unclaimed_reward: number | null
-}
-
 // ---------------- Helpers ----------------
 
-// همان تابع APR پایه که در status استفاده کردیم
-function calcAprBase(totalStakedActive: number): number {
-  const normalized = totalStakedActive / 10_000_000
-
-  if (normalized <= 0) return 0
-  if (normalized < 0.1) return 15
-  if (normalized < 0.25) return 18
-  if (normalized < 0.5) return 20
-  if (normalized < 1) return 22
-  if (normalized < 2) return 25
-  if (normalized < 5) return 30
-  if (normalized < 10) return 35
-  return 40
+function computeBaseApr(amount: number): number {
+  if (!amount || amount <= 0 || !Number.isFinite(amount)) return 0
+  const log10 = Math.log10(amount)
+  let aprRaw = 9 * log10
+  if (!Number.isFinite(aprRaw)) return 0
+  const apr = Math.min(60, Math.max(0, aprRaw))
+  return Number(apr.toFixed(2))
 }
 
-// XP → Level با سقف ۱۵ (تا دیگه ۱۱۱ نشه)
 function xpToLevel(xp: number): number {
   if (!xp || xp <= 0) return 1
 
-  // منحنی ساده: هر ~۷۵۰ XP یک لول، ولی حداکثر ۱۵
-  const base = 1 + Math.floor(xp / 750)
-  const level = Math.max(1, Math.min(base, 15))
+  const MAX_LEVEL = 20
+  const XP_FOR_MAX = 5250
+  const xpPerLevel = XP_FOR_MAX / (MAX_LEVEL - 1)
+
+  const base = 1 + Math.floor(xp / xpPerLevel)
+  const level = Math.max(1, Math.min(base, MAX_LEVEL))
   return level
 }
 
-const ONE_DAY_MS = 24 * 60 * 60 * 1000
-
-function dayUTC(d: Date) {
-  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
-}
-
-// محاسبه Level-bonus مطابق چیزی که الان در UI می‌بینی:
-// Level 1 → 0%
-// Level 2–5 → 0.5%
-// Level 6–10 → 1.0%
-// Level 11–15 → 1.5%
 function calcLevelBonus(level: number): number {
-  if (level >= 11) return 1.5
-  if (level >= 6) return 1.0
-  if (level >= 2) return 0.5
-  return 0
+  const MAX_LEVEL = 20
+  const MAX_LEVEL_BONUS = 20
+  if (!level || level <= 1) return 0
+  const effectiveLevel = Math.min(level, MAX_LEVEL)
+  const bonusPerLevel = MAX_LEVEL_BONUS / (MAX_LEVEL - 1)
+  const bonus = (effectiveLevel - 1) * bonusPerLevel
+  return Number(bonus.toFixed(2))
 }
 
-// bonus استریک: تا سقف ۲۰٪ (در status هم باید همین باشد)
 function calcStreakBonus(streak: number): number {
-  if (streak <= 0) return 0
+  if (!streak || streak <= 0) return 0
+  if (streak >= 7) return 10
+  if (streak >= 3) return 5
+  return 2
+}
 
-  // ۷ روز → حدوداً ۸–۹٪ ، ۲۰ روز به بعد تا سقف ۲۰٪
-  const capped = Math.min(streak, 20)
-  return +( (capped / 20) * 20 ).toFixed(1) // ۰ تا ۲۰ با دقت یک رقم اعشار
+// تبدیل تاریخ به شروع روز UTC (برای محاسبه درست روز Claim)
+function toUtcDateOnly(d: Date): number {
+  return Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate())
 }
 
 // ---------------- Handler ----------------
@@ -100,123 +83,147 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Missing fid' }, { status: 400 })
     }
 
-    // 1) پیدا / ساخت کاربر
-    const { data: existingUser, error: existingUserError } = await supabase
+    // 1) پیدا کردن کاربر
+    const { data: userRow, error: userErr } = await supabaseAdmin
       .from('users')
       .select('*')
       .eq('fid', fid)
       .single<UserRow>()
 
-    let user: UserRow
-
-    if (!existingUser || existingUserError) {
-      const { data: newUser, error: insertError } = await supabase
-        .from('users')
-        .insert({
-          fid,
-          username: `user_${fid}`,
-          xp: 0,
-          level: 1,
-          daily_streak: 0,
-          last_daily_claim: null,
-        })
-        .select('*')
-        .single<UserRow>()
-
-      if (insertError || !newUser) {
-        console.error('Failed to init user:', insertError)
-        return NextResponse.json({ error: 'Failed to init user' }, { status: 500 })
-      }
-
-      user = newUser
-    } else {
-      user = existingUser
+    if (userErr || !userRow) {
+      console.error('Failed to load user in /reward/claim:', userErr)
+      return NextResponse.json({ error: 'User not found' }, { status: 404 })
     }
 
-    // 2) جلوگیری از بیش از یک Claim در یک روز (بر اساس last_daily_claim)
+    const user = userRow
+
+    const now = new Date()
+    const todayUtc = toUtcDateOnly(now)
+
+    // 2) کنترل دوباره Claim در همان روز + محاسبه streak جدید
+    let newStreak = 1
     if (user.last_daily_claim) {
       const last = new Date(user.last_daily_claim)
-      const now = new Date()
+      const lastUtc = toUtcDateOnly(last)
+      const diffDays = Math.floor((todayUtc - lastUtc) / (24 * 60 * 60 * 1000))
 
-      const lastDay = dayUTC(last)
-      const nowDay = dayUTC(now)
-      const diffDays = Math.floor((nowDay - lastDay) / ONE_DAY_MS)
-
-      if (diffDays <= 0) {
-        // امروز قبلاً Claim کرده
+      if (diffDays === 0) {
         return NextResponse.json(
           { error: 'Already claimed today' },
-          { status: 400 },
+          { status: 400 }
         )
+      } else if (diffDays === 1) {
+        newStreak = (user.daily_streak || 0) + 1
+      } else {
+        newStreak = 1
       }
     }
 
-    // 3) استیک‌های فعال را بخوانیم
-    const { data: stakesRaw, error: stakesError } = await supabase
+    // 3) استیک‌ها (همه به جز withdrawn)
+    const { data: stakesRaw, error: stakesErr } = await supabaseAdmin
       .from('stakes')
       .select('*')
       .eq('user_id', user.id)
-      .eq('status', 'active')
+      .neq('status', 'withdrawn')
 
-    if (stakesError) {
-      console.error('Failed to load stakes:', stakesError)
+    if (stakesErr) {
+      console.error('Failed to load stakes in /reward/claim:', stakesErr)
       return NextResponse.json({ error: 'Failed to load stakes' }, { status: 500 })
     }
 
     const stakes = (stakesRaw || []) as StakeRow[]
-    const totalStakedActive = stakes.reduce(
+    const activeStakes = stakes.filter((s) => s.status === 'active')
+    const totalStakedActive = activeStakes.reduce(
       (sum, s) => sum + (s.staked_amount || 0),
-      0,
+      0
     )
 
-    // اگر استیک فعال ندارد، پاداش = ۰ (ولی می‌تواند XP/Streak هم نگیرد)
     if (totalStakedActive <= 0) {
       return NextResponse.json(
-        { error: 'No active stake for reward' },
-        { status: 400 },
+        { error: 'No active stake to claim rewards from' },
+        { status: 400 }
       )
     }
 
-    // 4) محاسبه Streak جدید
-    let newStreak = user.daily_streak || 0
-    const now = new Date()
+    // 4) APR Components (طبق v2)
+    const baseApr = computeBaseApr(totalStakedActive)
+    const streakBonus = calcStreakBonus(user.daily_streak || 0)
+    const levelBonus = calcLevelBonus(user.level || 1)
 
-    if (!user.last_daily_claim) {
-      // اولین Claim
-      newStreak = 1
-    } else {
-      const last = new Date(user.last_daily_claim)
-      const lastDay = dayUTC(last)
-      const nowDay = dayUTC(now)
-      const diffDays = Math.floor((nowDay - lastDay) / ONE_DAY_MS)
+    // NFT Bonus
+    let nftBonus = 0
+    if (totalStakedActive >= MIN_STAKE_FOR_NFT) {
+      const { data: nfts, error: nftErr } = await supabaseAdmin
+        .from('nft_ownership')
+        .select('id')
+        .eq('user_id', user.id)
+        .eq('is_active', true)
 
-      if (diffDays === 1) {
-        // دقیقا دیروز Claim کرده → ادامه‌ی streak
-        newStreak = (user.daily_streak || 0) + 1
-      } else if (diffDays > 1) {
-        // چند روز از دست داده → استریک از نو
-        newStreak = 1
-      } else if (diffDays <= 0) {
-        // نباید به اینجا برسیم چون بالا diffDays<=0 را رد کردیم
-        newStreak = user.daily_streak || 1
+      if (nftErr) {
+        console.warn('Failed to load NFTs in /reward/claim:', nftErr)
+      } else if (nfts && nfts.length > 0) {
+        nftBonus = NFT_BOOST_APR
       }
     }
 
-    // 5) XP جدید + Level جدید (با سقف ۱۵)
-    const xpGainPerClaim = 25 // هر Claim چند XP بدهیم
-    const newXp = (user.xp || 0) + xpGainPerClaim
+    const boostBonus = 0 // بعداً Boost 24/72/7 روزه رو اینجا اضافه می‌کنیم
+
+    const rawAprTotal =
+      baseApr + streakBonus + levelBonus + nftBonus + boostBonus
+    const aprTotal = Math.min(APR_CAP, rawAprTotal)
+
+    // 5) Accrue Rewards تا همین لحظه
+    const {
+      updatedStakes,
+      totalUnclaimedAll,
+    } = accrueRewardsForUserStakes(stakes, aprTotal, now)
+
+    // مبلغ قابل Claim روی استیک‌های active
+    const updatedById = new Map(updatedStakes.map((s) => [s.id, s]))
+    let claimable = 0
+    for (const s of activeStakes) {
+      const updated = updatedById.get(s.id) || s
+      claimable += updated.unclaimed_reward || 0
+    }
+
+    if (claimable <= 0) {
+      return NextResponse.json(
+        { error: 'No rewards available to claim' },
+        { status: 400 }
+      )
+    }
+
+    // 6) اعمال Claim Fee 2%
+    const grossReward = claimable
+    const feeAmount = Number((grossReward * CLAIM_FEE_RATE).toFixed(8))
+    const netReward = Number((grossReward - feeAmount).toFixed(8))
+
+    // 7) صفر کردن unclaimed_reward در همه استیک‌ها
+    const resetStakes = updatedStakes.map((s) => ({
+      id: s.id,
+      unclaimed_reward: 0,
+      last_reward_at: now.toISOString(),
+    }))
+
+    if (resetStakes.length > 0) {
+      await Promise.all(
+        resetStakes.map((s) =>
+          supabaseAdmin
+            .from('stakes')
+            .update({
+              unclaimed_reward: s.unclaimed_reward,
+              last_reward_at: s.last_reward_at,
+            })
+            .eq('id', s.id)
+        )
+      )
+    }
+
+    // 8) آپدیت XP، Level، Streak و last_daily_claim
+    const newXp = (user.xp || 0) + DAILY_XP
     const newLevel = xpToLevel(newXp)
 
-    // 6) محاسبه APR و پاداش امروز (دلخواه: از همین منطق status استفاده می‌کنیم)
-    const baseApr = calcAprBase(totalStakedActive)
-    const streakBonus = calcStreakBonus(newStreak) // بعد از آپدیت streak
-    const levelBonus = calcLevelBonus(newLevel)
-
-    const aprTotal = baseApr + streakBonus + levelBonus
-    const dailyReward = (totalStakedActive * (aprTotal / 100)) / 365
-
-    // 7) آپدیت کاربر
-    const { error: updateUserError } = await supabase
+    await supabaseAdmin
       .from('users')
       .update({
         xp: newXp,
@@ -226,23 +233,37 @@ export async function POST(req: Request) {
       })
       .eq('id', user.id)
 
-    if (updateUserError) {
-      console.error('Failed to update user in claim:', updateUserError)
-      return NextResponse.json({ error: 'Failed to update user' }, { status: 500 })
+    // 9) (اختیاری) لاگ در reward_logs – اگر اسکیمای جدول فرق داشت، خطا نادیده گرفته می‌شود
+    try {
+      await supabaseAdmin.from('reward_logs').insert({
+        user_id: user.id,
+        stake_id: null,
+        amount: netReward,
+        kind: 'daily_claim',
+      } as any)
+    } catch (logErr) {
+      console.warn('Failed to insert reward_logs in /reward/claim:', logErr)
     }
 
-    // اینجا فعلاً فقط مقدار dailyReward را برمی‌گردانیم.
-    // در آینده می‌توانیم آن را به جدول پاداش‌ها اضافه کنیم.
+    // 10) پاسخ نهایی
     return NextResponse.json({
-      success: true,
-      reward: dailyReward,
-      apr: {
+      ok: true,
+      message: 'Daily claim successful',
+      rewards: {
+        gross: grossReward,
+        fee: feeAmount,
+        net: netReward,
+        totalUnclaimedAll,
+      },
+      apr_components: {
         base: baseApr,
         streak: streakBonus,
         level: levelBonus,
+        nft: nftBonus,
+        boost: boostBonus,
         total: aprTotal,
       },
-      user: {
+      user_after: {
         xp: newXp,
         level: newLevel,
         daily_streak: newStreak,
@@ -253,7 +274,7 @@ export async function POST(req: Request) {
     console.error('API /reward/claim error:', err)
     return NextResponse.json(
       { error: 'Server error while claiming' },
-      { status: 500 },
+      { status: 500 }
     )
   }
 }

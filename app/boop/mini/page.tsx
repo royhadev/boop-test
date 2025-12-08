@@ -11,6 +11,8 @@ type UserInfo = {
   level: number
   daily_streak: number
   last_daily_claim: string | null
+  // برای محاسبات احتمالی آینده
+  created_at?: string
 }
 
 type StakeInfo = {
@@ -60,7 +62,7 @@ export default function MiniHomePage() {
   const [error, setError] = useState<string | null>(null)
   const [info, setInfo] = useState<string | null>(null)
 
-  // Live accrual since last claim (frontend-only, approximate)
+  // Live accrual since last claim (frontend-only)
   const [liveAccrued, setLiveAccrued] = useState(0)
   const [sinceText, setSinceText] = useState<string | null>(null)
 
@@ -68,7 +70,7 @@ export default function MiniHomePage() {
     setLoading(true)
     setError(null)
     try {
-      const resp = await fetch('/api/reward/status', {
+      const resp = await fetch('/api/user/status', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ fid }),
@@ -91,7 +93,7 @@ export default function MiniHomePage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fid])
 
-  // Live accrual calculator – recompute whenever data changes and every 10s
+  // Live accrual calculator – هر ۱۰ ثانیه و هر بار که data عوض شد
   useEffect(() => {
     if (!data) {
       setLiveAccrued(0)
@@ -99,21 +101,28 @@ export default function MiniHomePage() {
       return
     }
 
-    function updateLiveAccrual() {
-      const user = data.user
-      const dailyReward = data.daily_reward || 0
-      const totalStaked = data.totals.totalStaked || 0
+    const dailyReward = data.daily_reward || 0
+    const totalStaked = data.totals.totalStaked || 0
 
-      // اگر هنوز استیک فعالی نداریم یا daily_reward صفره، چیزی نشون نده
-      if (!user.last_daily_claim || dailyReward <= 0 || totalStaked <= 0) {
+    if (dailyReward <= 0 || totalStaked <= 0) {
+      setLiveAccrued(0)
+      setSinceText(null)
+      return
+    }
+
+    function update() {
+      const user = data.user
+
+      if (!user.last_daily_claim) {
         setLiveAccrued(0)
-        setSinceText(null)
+        setSinceText('—')
         return
       }
 
       const last = new Date(user.last_daily_claim)
       const now = new Date()
       const diffMs = now.getTime() - last.getTime()
+
       if (diffMs <= 0) {
         setLiveAccrued(0)
         setSinceText('just claimed')
@@ -123,11 +132,9 @@ export default function MiniHomePage() {
       const diffSeconds = diffMs / 1000
       const daysPassed = diffSeconds / 86400
 
-      // ✅ مقدار تخمینی پاداش جمع‌شده از آخرین Claim
-      // (می‌تونه بیشتر از ۱ روز هم باشه)
+      // ✅ بدون سقف، هرچند روز بگذرد اضافه می‌شود
       const estAccrued = dailyReward * daysPassed
 
-      // متن نمایشی "از آخرین Claim تا حالا"
       let label: string
       if (daysPassed < 1) {
         const hours = Math.floor(diffSeconds / 3600)
@@ -146,8 +153,8 @@ export default function MiniHomePage() {
       setSinceText(label)
     }
 
-    updateLiveAccrual()
-    const timer = setInterval(updateLiveAccrual, 10_000)
+    update()
+    const timer = setInterval(update, 10_000)
     return () => clearInterval(timer)
   }, [data])
 
@@ -176,6 +183,28 @@ export default function MiniHomePage() {
     }
   }
 
+  function formatNumber(n: number, decimals = 6) {
+    return n.toFixed(decimals)
+  }
+
+  function formatInt(n: number) {
+    return Number.isFinite(n) ? n.toLocaleString('en-US') : '0'
+  }
+
+  const referralLink = `https://boop.app/mini?ref=${fid}`
+
+  async function copyReferral() {
+    try {
+      if (typeof navigator !== 'undefined' && navigator.clipboard) {
+        await navigator.clipboard.writeText(referralLink)
+        setInfo('Referral link copied.')
+      }
+    } catch (e) {
+      console.error(e)
+      setError('Failed to copy link')
+    }
+  }
+
   if (loading && !data) {
     return (
       <div className="w-full max-w-xl mx-auto p-4 text-center text-slate-200">
@@ -192,21 +221,64 @@ export default function MiniHomePage() {
     )
   }
 
-  const { user, totals, staking_summary, apr_components, daily_reward, claimed_today } = data
+  const {
+    user,
+    totals,
+    staking_summary,
+    apr_components,
+    daily_reward,
+    claimed_today,
+  } = data
+
+  const hasNftBoost = apr_components.nft > 0
+  const hasBoost = apr_components.boost > 0
 
   return (
     <div className="w-full max-w-xl mx-auto p-4 space-y-5 text-white">
       {/* Header */}
       <div className="flex items-center justify-between">
         <div>
-          <h1 className="text-2xl font-bold">Boop miniapp</h1>
+          <h1 className="text-2xl font-bold">BOOP on Base</h1>
           <p className="text-xs text-slate-400">
-            Claim daily. Stake BOOP. Earn rewards.
+            Claim once per day to keep your streak and grow XP.
           </p>
         </div>
-        <div className="text-right">
-          <p className="text-xs text-slate-400">FID</p>
+        <div className="text-right text-xs text-slate-400 space-y-0.5">
+          <p className="text-[11px]">FID</p>
           <p className="text-sm font-semibold">{fid}</p>
+          <p>
+            XP <span className="font-semibold text-slate-100">{user.xp}</span>
+          </p>
+          <p>
+            Level{' '}
+            <span className="font-semibold text-slate-100">{user.level}</span>
+          </p>
+          <p>
+            Streak{' '}
+            <span className="font-semibold text-slate-100">
+              {user.daily_streak}
+            </span>{' '}
+            days
+          </p>
+          {/* ✅ نمایش وضعیت NFT و Boost */}
+          <p>
+            NFT Boost:{' '}
+            {hasNftBoost ? (
+              <span className="font-semibold text-emerald-400">
+                +{apr_components.nft.toFixed(1)}% active
+              </span>
+            ) : (
+              <span className="font-semibold text-slate-500">none</span>
+            )}
+          </p>
+          {hasBoost && (
+            <p>
+              Extra Boost:{' '}
+              <span className="font-semibold text-sky-400">
+                +{apr_components.boost.toFixed(1)}%
+              </span>
+            </p>
+          )}
         </div>
       </div>
 
@@ -222,10 +294,10 @@ export default function MiniHomePage() {
         </div>
       )}
 
-      {/* Daily claim */}
+      {/* Daily reward + claim */}
       <div className="bg-slate-900/70 p-4 rounded-xl border border-slate-700 space-y-3">
         <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold">Daily claim</h2>
+          <h2 className="text-sm font-semibold">Daily reward (est.)</h2>
           <button
             onClick={loadStatus}
             className="px-3 py-1.5 text-xs rounded-md bg-slate-700 hover:bg-slate-600"
@@ -234,49 +306,42 @@ export default function MiniHomePage() {
           </button>
         </div>
 
-        <p className="text-xs text-slate-400">
-          Claim once per day to keep your streak and update rewards.
-        </p>
-
         <div className="flex items-baseline justify-between mt-1">
           <div>
-            <p className="text-xs text-slate-400">Estimated daily reward</p>
-            <p className="text-2xl font-extrabold text-yellow-300">
-              {daily_reward.toFixed(6)}{' '}
+            <p className="text-xs text-slate-400">BOOP per day</p>
+            <p className="text-3xl font-extrabold text-yellow-300">
+              {formatNumber(daily_reward)}{' '}
               <span className="text-xs text-slate-300">BOOP / day</span>
-            </p>
-          </div>
-          <div className="text-right text-xs text-slate-400">
-            <p>
-              Streak: <span className="font-semibold">{user.daily_streak}</span> days
-            </p>
-            <p>
-              Level: <span className="font-semibold">{user.level}</span>
             </p>
           </div>
         </div>
 
-        {/* Live accrual since last claim */}
-        {sinceText && (
-          <div className="mt-2 rounded-lg bg-slate-800/70 px-3 py-2 text-xs text-slate-200">
-            <div className="flex items-center justify-between">
-              <span className="text-slate-400">Since last claim</span>
-              <span className="font-medium text-slate-100">{sinceText}</span>
-            </div>
-            <div className="flex items-center justify-between mt-1">
-              <span className="text-slate-400">Estimated accumulated</span>
-              <span className="font-semibold text-yellow-300">
-                {liveAccrued.toFixed(6)}{' '}
+        {/* Since last daily claim – با آپدیت ۱۰ ثانیه‌ای */}
+        {totals.totalStaked > 0 && daily_reward > 0 && (
+          <div className="mt-3 rounded-lg bg-slate-800/70 px-3 py-3 text-xs">
+            <p className="text-[11px] text-slate-400 mb-1">
+              SINCE LAST DAILY CLAIM
+            </p>
+            <div className="flex items-baseline justify-between">
+              <p className="text-2xl font-bold text-slate-50">
+                {formatNumber(liveAccrued)}{' '}
                 <span className="text-[10px] text-slate-300">BOOP</span>
-              </span>
+              </p>
+              <p className="text-[11px] text-slate-400">
+                Time passed:{' '}
+                <span className="font-semibold">{sinceText ?? '—'}</span>
+              </p>
             </div>
+            <p className="mt-1 text-[11px] text-slate-500">
+              Updates every 10 seconds, based on your current APR.
+            </p>
           </div>
         )}
 
         <button
           onClick={handleClaim}
           disabled={claiming || claimed_today}
-          className={`w-full px-4 py-2 rounded-md text-sm font-semibold ${
+          className={`w-full mt-3 px-4 py-2 rounded-md text-sm font-semibold ${
             claimed_today
               ? 'bg-slate-800 text-slate-400 cursor-not-allowed'
               : claiming
@@ -284,76 +349,124 @@ export default function MiniHomePage() {
               : 'bg-yellow-400 text-slate-900 hover:bg-yellow-300'
           }`}
         >
-          {claimed_today ? 'Already claimed today' : claiming ? 'Claiming…' : 'Claim today'}
+          {claimed_today
+            ? 'Already claimed today'
+            : claiming
+            ? 'Claiming…'
+            : 'Claim daily reward'}
         </button>
+
+        <p className="mt-1 text-[11px] text-slate-500">
+          Missing one day will break your streak.
+        </p>
       </div>
 
-      {/* Wallet + stats */}
-      <div className="grid grid-cols-2 gap-3">
+      {/* Main stats – کوتاه و تمیز */}
+      <div className="grid grid-cols-3 gap-3">
         <div className="bg-slate-900/70 p-3 rounded-xl border border-slate-700">
           <p className="text-[11px] text-slate-400">Wallet balance (demo)</p>
-          <p className="text-lg font-bold">0.000000 BOOP</p>
-          <p className="text-[10px] text-slate-500">
-            Later this will read your real BOOP balance.
+          <p className="mt-1 text-lg font-bold">0.00 BOOP</p>
+          <p className="mt-1 text-[10px] text-slate-500">
+            Mainnet version will show your real BOOP balance.
           </p>
         </div>
         <div className="bg-slate-900/70 p-3 rounded-xl border border-slate-700">
-          <p className="text-[11px] text-slate-400">Staked</p>
-          <p className="text-lg font-bold">
-            {Number(totals.totalStaked || 0).toFixed(0)}{' '}
+          <p className="text-[11px] text-slate-400">Total staked (active)</p>
+          <p className="mt-1 text-lg font-bold">
+            {formatInt(totals.totalStaked || 0)}{' '}
             <span className="text-xs text-slate-400">BOOP</span>
           </p>
-          <p className="text-[11px] text-slate-500">Active positions only.</p>
+          <p className="mt-1 text-[10px] text-slate-500">
+            Only positions with status <b>active</b> are counted.
+          </p>
         </div>
-      </div>
-
-      {/* XP / APR */}
-      <div className="bg-slate-900/70 p-4 rounded-xl border border-slate-700 space-y-2">
-        <div className="flex justify-between">
-          <div>
-            <p className="text-xs text-slate-400">XP</p>
-            <p className="text-xl font-bold">{user.xp}</p>
-          </div>
-          <div className="text-right">
-            <p className="text-xs text-slate-400">Level</p>
-            <p className="text-xl font-bold">{user.level}</p>
-          </div>
-        </div>
-
-        <div className="mt-2">
-          <p className="text-xs text-slate-400">APR</p>
-          <p className="text-2xl font-extrabold text-emerald-400">
+        <div className="bg-slate-900/70 p-3 rounded-xl border border-slate-700">
+          <p className="text-[11px] text-slate-400">Current APR (with boosts)</p>
+          <p className="mt-1 text-lg font-extrabold text-emerald-400">
             {apr_components.total.toFixed(2)}%
           </p>
-          <p className="text-[11px] text-slate-500">
-            Base {apr_components.base.toFixed(1)}% · Streak {apr_components.streak.toFixed(1)}% · Level{' '}
+          <p className="mt-1 text-[10px] text-slate-500">
+            Base {apr_components.base.toFixed(1)}% · Streak{' '}
+            {apr_components.streak.toFixed(1)}% · Level{' '}
             {apr_components.level.toFixed(1)}%
+            {' · '}NFT {apr_components.nft.toFixed(1)}%
+            {' · '}Boost {apr_components.boost.toFixed(1)}%
           </p>
         </div>
       </div>
 
-      {/* Staking summary */}
-      <div className="bg-slate-900/70 p-4 rounded-xl border border-slate-700 space-y-2">
-        <h2 className="text-sm font-semibold">Staking summary</h2>
-
-        <div className="grid grid-cols-3 gap-2 text-[11px] mt-1">
-          <div>
-            <p className="text-slate-400">Active</p>
-            <p className="text-sm font-semibold">{staking_summary.active}</p>
-          </div>
-          <div>
-            <p className="text-slate-400">Pending</p>
-            <p className="text-sm font-semibold">{staking_summary.pending_unstake}</p>
-          </div>
-          <div>
-            <p className="text-slate-400">Unlocked</p>
-            <p className="text-sm font-semibold">{staking_summary.unlocked}</p>
-          </div>
+      {/* Boosts & NFTs + Referral */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div className="bg-slate-900/70 p-3 rounded-xl border border-slate-700 space-y-1">
+          <p className="text-xs font-semibold">Boosts & NFTs</p>
+          <p className="text-[11px] text-slate-400">
+            Permanent NFT boost and temporary Boost items increase your APR on
+            top of base, streak and level.
+          </p>
+          <p className="mt-1 text-[11px] text-slate-500">
+            Current NFT boost:{' '}
+            <span className="font-semibold text-emerald-400">
+              {apr_components.nft.toFixed(1)}%
+            </span>
+          </p>
+          <p className="text-[11px] text-slate-500">
+            Current extra Boost:{' '}
+            <span className="font-semibold text-sky-400">
+              {apr_components.boost.toFixed(1)}%
+            </span>
+          </p>
         </div>
 
-        <p className="text-[11px] text-slate-500 mt-1">
-          Create and manage positions in the <b>Stake</b> and <b>Withdraw</b> tabs.
-        </p>
+        <div className="bg-slate-900/70 p-3 rounded-xl border border-slate-700 space-y-2">
+          <p className="text-xs font-semibold">Referral & social</p>
+          <p className="text-[11px] text-slate-400">
+            Share your Boop link. In later versions, referrals may unlock extra
+            XP or airdrops.
+          </p>
+
+          <div className="mt-1 rounded-lg bg-slate-800/70 px-3 py-2 text-[11px]">
+            <p className="text-slate-400 mb-1">Your referral link (demo)</p>
+            <p className="truncate text-[11px] mb-2">{referralLink}</p>
+            <button
+              type="button"
+              onClick={copyReferral}
+              className="px-3 py-1.5 rounded-md bg-yellow-400 text-slate-900 text-xs font-semibold hover:bg-yellow-300"
+            >
+              Copy link
+            </button>
+          </div>
+
+          <div className="pt-1 text-[11px] text-slate-500 space-y-0.5">
+            <p>Twitter: @boopapp</p>
+            <p>Website: boopapps.com</p>
+            <p>Telegram: coming later</p>
+          </div>
+        </div>
+      </div>
+
+      {/* خلاصه استیک‌ها */}
+      <div className="bg-slate-900/70 p-3 rounded-xl border border-slate-700 text-[11px] text-slate-400">
+        <p className="font-semibold mb-1">Staking summary</p>
+        <div className="flex gap-4">
+          <p>
+            Active:{' '}
+            <span className="font-semibold text-slate-100">
+              {staking_summary.active}
+            </span>
+          </p>
+          <p>
+            Pending:{' '}
+            <span className="font-semibold text-slate-100">
+              {staking_summary.pending_unstake}
+            </span>
+          </p>
+          <p>
+            Unlocked:{' '}
+            <span className="font-semibold text-slate-100">
+              {staking_summary.unlocked}
+            </span>
+          </p>
+        </div>
       </div>
     </div>
   )

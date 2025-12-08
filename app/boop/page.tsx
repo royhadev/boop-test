@@ -86,7 +86,7 @@ export default function BoopPage() {
       setLoading(true)
       setMessage(null)
 
-      const res = await fetch('/api/reward/status', {
+      const res = await fetch('/api/user/status', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ fid }),

@@ -1,23 +1,18 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { createClient } from '@supabase/supabase-js'
+import { supabaseAdmin } from '../../../../lib/supabaseAdmin'
 
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL!
-const supabaseKey =
-  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+// 🔹 حداقل استیک (دل‌خواه، می‌تونی تغییر بدی)
+const MIN_STAKE_AMOUNT = 1000
 
-const supabase = createClient(supabaseUrl, supabaseKey)
-
-// Helper برای محاسبه APR_base طبق فرمولی که با هم توافق کردیم
+// Helper برای محاسبه APR_base طبق منحنی غیرخطی
 function computeBaseApr(stakedAmount: number): number {
   if (!stakedAmount || stakedAmount <= 0 || !Number.isFinite(stakedAmount)) {
     return 15 // حداقل APR
   }
 
-  // APR_base_raw = 10 + 8 × log10(staked_amount)
   const log10 = Math.log10(stakedAmount)
   let aprRaw = 10 + 8 * log10
 
-  // clamp بین 15% و 60%
   if (!Number.isFinite(aprRaw)) {
     aprRaw = 15
   }
@@ -32,22 +27,23 @@ export async function POST(req: NextRequest) {
     const { fid, amount } = body as { fid?: number; amount?: number }
 
     if (!fid) {
-      return NextResponse.json(
-        { error: 'Missing fid' },
-        { status: 400 }
-      )
+      return NextResponse.json({ error: 'Missing fid' }, { status: 400 })
     }
 
     const stakeAmount = Number(amount)
-    if (!stakeAmount || stakeAmount <= 0 || !Number.isFinite(stakeAmount)) {
+    if (!stakeAmount || !Number.isFinite(stakeAmount) || stakeAmount <= 0) {
+      return NextResponse.json({ error: 'Invalid stake amount' }, { status: 400 })
+    }
+
+    if (stakeAmount < MIN_STAKE_AMOUNT) {
       return NextResponse.json(
-        { error: 'Invalid stake amount' },
+        { error: `Minimum stake is ${MIN_STAKE_AMOUNT} BOOP` },
         { status: 400 }
       )
     }
 
     // 1) پیدا کردن user بر اساس fid
-    const { data: user, error: userError } = await supabase
+    const { data: user, error: userError } = await supabaseAdmin
       .from('users')
       .select('id, fid, username, xp, level, daily_streak, last_daily_claim')
       .eq('fid', fid)
@@ -60,27 +56,28 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    // 2) محاسبه APR_base بر اساس مقدار stake
+    // 2) محاسبه APR_base بر اساس مقدار همین stake
     const aprBase = computeBaseApr(stakeAmount)
 
-    // 3) فقط زمان شروع استیک؛ هنوز هیچ درخواست Unstakeای ثبت نشده
     const now = new Date()
     const startedAt = now.toISOString()
 
-    // 4) ساخت رکورد stake جدید
-    const { data: newStake, error: stakeError } = await supabase
+    // 3) ساخت رکورد stake جدید
+    const { data: newStake, error: stakeError } = await supabaseAdmin
       .from('stakes')
       .insert({
         user_id: user.id,
         staked_amount: stakeAmount,
         apr_base: aprBase,
         started_at: startedAt,
-        // تا زمانی که کاربر Unstake نکند، این مقدار خالی (null) می‌ماند
+        last_reward_at: startedAt, // نقطه شروع محاسبه‌ی پاداش
         unlock_at: null,
         status: 'active',
         unclaimed_reward: 0,
       })
-      .select('id, staked_amount, apr_base, unlock_at, status, unclaimed_reward')
+      .select(
+        'id, staked_amount, apr_base, started_at, last_reward_at, unlock_at, status, unclaimed_reward'
+      )
       .single()
 
     if (stakeError || !newStake) {
@@ -91,7 +88,16 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    // می‌تونی بعداً اینجا لاگ یا event هم اضافه کنی
+    // 4) لاگ سبک
+    try {
+      await supabaseAdmin.from('api_logs').insert({
+        user_id: user.id,
+        endpoint: '/api/stake/create',
+      })
+    } catch (logErr) {
+      console.warn('Failed to log /api/stake/create:', logErr)
+    }
+
     return NextResponse.json(
       {
         message: 'Stake created successfully',
@@ -100,7 +106,7 @@ export async function POST(req: NextRequest) {
       { status: 200 }
     )
   } catch (err) {
-    console.error(err)
+    console.error('Stake create error:', err)
     return NextResponse.json(
       { error: 'Unexpected error while creating stake' },
       { status: 500 }

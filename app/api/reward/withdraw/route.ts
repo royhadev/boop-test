@@ -3,7 +3,7 @@ import { createClient } from '@supabase/supabase-js'
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 )
 
 export async function POST(req: Request) {
@@ -25,11 +25,12 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'User not found' }, { status: 404 })
     }
 
-    // 2) همه استیک‌های کاربر
+    // 2) همه استیک‌هایی که unclaimed_reward > 0 دارند
     const { data: stakes, error: stakeErr } = await supabase
       .from('stakes')
-      .select('*')
+      .select('id, unclaimed_reward')
       .eq('user_id', user.id)
+      .gt('unclaimed_reward', 0)
 
     if (stakeErr) {
       console.error('Stake fetch error:', stakeErr)
@@ -47,7 +48,12 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'No rewards to withdraw' }, { status: 400 })
     }
 
-    // 3) صفر کردن unclaimed_reward برای همه استیک‌های این یوزر
+    // 3) محاسبه Fee ۲٪
+    const feePercent = 2
+    const feeAmount = (totalReward * feePercent) / 100
+    const netReward = totalReward - feeAmount
+
+    // 4) صفر کردن unclaimed_reward برای همه استیک‌های این یوزر
     const { error: updateErr } = await supabase
       .from('stakes')
       .update({ unclaimed_reward: 0 })
@@ -59,11 +65,16 @@ export async function POST(req: Request) {
       return NextResponse.json({ error: 'Failed to update rewards' }, { status: 500 })
     }
 
-    // TODO: در نسخه‌ی واقعی اینجا call قرارداد و ارسال توکن به والت انجام می‌شود
+    // TODO:
+    //  - feeAmount را بین Burn / Treasury / Team تقسیم کن و در جدول جدا لاگ کن
+    //  - روی زنجیره توکن را بفرست به کیف پول کاربر
 
     return NextResponse.json({
       success: true,
-      withdrawnReward: totalReward,
+      withdrawnReward: netReward,   // مبلغ خالص برای کاربر
+      grossReward: totalReward,     // مبلغ قبل از fee
+      feePercent,
+      feeAmount,
     })
   } catch (err) {
     console.error('Reward withdraw error:', err)
