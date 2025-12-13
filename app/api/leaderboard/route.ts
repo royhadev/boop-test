@@ -15,12 +15,10 @@ function computeScore(xp: number, totalStaked: number) {
 
 export async function GET(req: Request) {
   try {
-    // 🔹 CACHE (45s)
+    // ✅ cache 45s
     const cacheKey = `leaderboard:${req.url}`;
     const cached = getCache<any>(cacheKey);
-    if (cached) {
-      return NextResponse.json(cached);
-    }
+    if (cached) return NextResponse.json(cached);
 
     const { searchParams } = new URL(req.url);
 
@@ -29,7 +27,7 @@ export async function GET(req: Request) {
     const onlyStakers = searchParams.get("onlyStakers") === "1";
     const fidParam = n(searchParams.get("fid"), 0);
 
-    // 1) users
+    // users
     const { data: users, error: uErr } = await supabaseAdmin
       .from("users")
       .select("*");
@@ -41,7 +39,7 @@ export async function GET(req: Request) {
       );
     }
 
-    // 2) stakes
+    // stakes
     const { data: stakes, error: sErr } = await supabaseAdmin
       .from("stakes")
       .select("*");
@@ -53,7 +51,7 @@ export async function GET(req: Request) {
       );
     }
 
-    // 3) aggregate stake per fid
+    // aggregate stake per fid
     const stakeMap = new Map<number, number>();
     for (const s of stakes) {
       const fid = n(s.fid, 0);
@@ -70,7 +68,7 @@ export async function GET(req: Request) {
       stakeMap.set(fid, (stakeMap.get(fid) ?? 0) + amt);
     }
 
-    // 4) build rows
+    // rows
     let rows = users.map((u: any) => {
       const fid = u.fid;
       const totalStaked = stakeMap.get(fid) ?? 0;
@@ -85,27 +83,37 @@ export async function GET(req: Request) {
         daily_streak: n(u.daily_streak, 0),
         totalStaked,
         score: computeScore(xp, totalStaked),
+
+        // ✅ UX flags (filled after sort)
+        rank: null as number | null,
+        isMe: fidParam ? fid === fidParam : false,
+        isTop10: false,
+        isStaker: totalStaked > 0,
       };
     });
 
-    if (onlyStakers) {
-      rows = rows.filter(r => r.totalStaked > 0);
-    }
+    if (onlyStakers) rows = rows.filter(r => r.totalStaked > 0);
 
-    // 5) sort
+    // sort
     rows.sort((a, b) => {
       if (b.score !== a.score) return b.score - a.score;
       return b.xp - a.xp;
     });
 
-    // 6) my rank
-    let myRank: number | null = null;
-    if (fidParam) {
-      const idx = rows.findIndex(r => r.fid === fidParam);
-      if (idx >= 0) myRank = idx + 1;
+    // fill ranks + top10
+    for (let i = 0; i < rows.length; i++) {
+      rows[i].rank = i + 1;
+      rows[i].isTop10 = rows[i].rank <= 10;
     }
 
-    // 7) pagination
+    // myRank
+    let myRank: number | null = null;
+    if (fidParam) {
+      const mine = rows.find(r => r.fid === fidParam);
+      myRank = mine?.rank ?? null;
+    }
+
+    // pagination
     const total = rows.length;
     const start = (page - 1) * limit;
     const end = start + limit;
@@ -131,4 +139,3 @@ export async function GET(req: Request) {
     );
   }
 }
-

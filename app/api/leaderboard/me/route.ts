@@ -17,18 +17,13 @@ export async function GET(req: Request) {
   try {
     const cacheKey = `leaderboard:me:${req.url}`;
     const cached = getCache<any>(cacheKey);
-    if (cached) {
-      return NextResponse.json(cached);
-    }
+    if (cached) return NextResponse.json(cached);
 
     const { searchParams } = new URL(req.url);
     const fid = n(searchParams.get("fid"), 0);
 
     if (!fid) {
-      return NextResponse.json(
-        { error: "fid is required" },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "fid is required" }, { status: 400 });
     }
 
     // users
@@ -87,37 +82,40 @@ export async function GET(req: Request) {
         daily_streak: n(u.daily_streak, 0),
         totalStaked,
         score: computeScore(xp, totalStaked),
+
+        // filled after sort:
+        rank: 0,
+        isTop10: false,
+        isStaker: totalStaked > 0,
       };
     });
 
+    // sort
     rows.sort((a, b) => {
       if (b.score !== a.score) return b.score - a.score;
       return b.xp - a.xp;
     });
 
-    const idx = rows.findIndex(r => r.fid === fid);
-    if (idx < 0) {
-      return NextResponse.json(
-        { error: "User not found" },
-        { status: 404 }
-      );
+    // fill global ranks
+    for (let i = 0; i < rows.length; i++) {
+      rows[i].rank = i + 1;
+      rows[i].isTop10 = rows[i].rank <= 10;
     }
 
-    const myRank = idx + 1;
-    const me = { ...rows[idx], rank: myRank, isMe: true };
+    const idx = rows.findIndex(r => r.fid === fid);
+    if (idx < 0) {
+      return NextResponse.json({ error: "User not found" }, { status: 404 });
+    }
 
+    const me = { ...rows[idx], isMe: true };
     const neighbors = rows
       .slice(Math.max(0, idx - 2), Math.min(rows.length, idx + 3))
-      .map((r, i) => ({
-        ...r,
-        rank: Math.max(1, idx - 2) + i,
-        isMe: r.fid === fid,
-      }));
+      .map(r => ({ ...r, isMe: r.fid === fid }));
 
     const response = {
       ok: true,
       fid,
-      myRank,
+      myRank: me.rank,
       myScore: me.score,
       me,
       neighbors,
