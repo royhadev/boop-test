@@ -1,24 +1,26 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { supabaseAdmin } from '../../../../lib/supabaseAdmin'
 
-// 🔹 حداقل استیک (دل‌خواه، می‌تونی تغییر بدی)
+// 🔹 حداقل استیک (طبق طراحی سیستم)
 const MIN_STAKE_AMOUNT = 1000
 
-// Helper برای محاسبه APR_base طبق منحنی غیرخطی
+// 🔹 Helper برای محاسبه APR_base طبق Tokenomics v2
+//
+// APR_base = 9 * log10(stake)
+// سقف = 60%
+// کف = 0%  (چون حداقل استیک ما 1000 هست، عملاً APR از ~27% شروع می‌شود)
 function computeBaseApr(stakedAmount: number): number {
   if (!stakedAmount || stakedAmount <= 0 || !Number.isFinite(stakedAmount)) {
-    return 15 // حداقل APR
+    return 0
   }
 
   const log10 = Math.log10(stakedAmount)
-  let aprRaw = 10 + 8 * log10
+  let aprRaw = 9 * log10
 
-  if (!Number.isFinite(aprRaw)) {
-    aprRaw = 15
-  }
+  if (!Number.isFinite(aprRaw)) return 0
 
-  const apr = Math.min(60, Math.max(15, aprRaw))
-  return apr
+  const apr = Math.min(60, Math.max(0, aprRaw))
+  return Number(apr.toFixed(2))
 }
 
 export async function POST(req: NextRequest) {
@@ -56,7 +58,7 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    // 2) محاسبه APR_base بر اساس مقدار همین stake
+    // 2) محاسبه APR_base بر اساس مقدار همین stake (طبق منحنی v2)
     const aprBase = computeBaseApr(stakeAmount)
 
     const now = new Date()
@@ -88,11 +90,16 @@ export async function POST(req: NextRequest) {
       )
     }
 
-    // 4) لاگ سبک
+    // 4) لاگ سبک برای دیباگ/آمار (اختیاری)
     try {
-      await supabaseAdmin.from('api_logs').insert({
-        user_id: user.id,
-        endpoint: '/api/stake/create',
+      await supabaseAdmin.from('event_logs').insert({
+        type: 'stake_create',
+        fid,
+        payload: {
+          stake_amount: stakeAmount,
+          apr_base: aprBase,
+        },
+        created_at: startedAt,
       })
     } catch (logErr) {
       console.warn('Failed to log /api/stake/create:', logErr)

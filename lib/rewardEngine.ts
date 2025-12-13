@@ -1,126 +1,113 @@
 // lib/rewardEngine.ts
-// Reward accrual logic for user stakes (pure functions, no DB inside)
+// Server-side reward + APR helper (single source of truth).
+// Decisions enforced:
+// - Base APR max = 60%
+// - Base APR reaches 60% at 2,500,000 BOOP staked (cap)
+// - NFT bonus max = +20%
+// - Boost bonus max = +20%
+// - Level bonus max = +20%
+// - Streak bonus max = +10%
+// - Total APR clamp to 130%
+//
+// Extra rule (IMPORTANT):
+// - If user stake < MIN_STAKE, total APR must be 0 (no level/streak/nft/boost bonuses)
+//   because bonuses only apply to stakers.
 
-export type StakeStatus =
-  | 'active'
-  | 'pending_unstake'
-  | 'unlocking'
-  | 'unlocked'
-  | 'withdrawn'
-  | null
-
-export interface StakeRow {
-  id: string
-  user_id: string
-  staked_amount: number
-  apr_base: number | null
-  started_at: string
-  unlock_at: string | null
-  status: StakeStatus
-  last_reward_at: string | null
-  unclaimed_reward: number | null
+export type AprComponents = {
+  base: number
+  nft: number
+  boost: number
+  level: number
+  streak: number
 }
 
-export interface AccrualResult {
-  updatedStakes: StakeRow[]
-  totalNewlyAccrued: number
-  totalUnclaimedAll: number
+export type AprResult = {
+  totalApr: number
+  components: AprComponents
+}
+
+export const APR = {
+  MIN_STAKE: 1_000,
+  BASE_MAX: 60,
+  BASE_STAKE_CAP: 2_500_000,
+  NFT_MAX: 20,
+  BOOST_MAX: 20,
+  LEVEL_MAX: 20,
+  STREAK_MAX: 10,
+  TOTAL_MAX: 130,
+} as const
+
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n))
 }
 
 /**
- * Accrue rewards for a user's stakes incrementally.
- *
- * - فقط روی استیک‌های status === 'active' پاداش حساب می‌کند.
- * - از last_reward_at تا now محاسبه می‌کند (اگر last_reward_at خالی بود → started_at).
- * - از aprTotal (APR نهایی کاربر) برای همه استیک‌های active استفاده می‌کند.
+ * Monotonic base APR curve:
+ * - 0% at MIN_STAKE
+ * - 60% at BASE_STAKE_CAP
+ * - never decreases when stake increases
  */
-export function accrueRewardsForUserStakes(
-  stakes: StakeRow[],
-  aprTotal: number,
-  now: Date
-): AccrualResult {
-  if (!aprTotal || aprTotal <= 0) {
-    const totalUnclaimed = stakes.reduce(
-      (sum, s) => sum + (s.unclaimed_reward ?? 0),
-      0
-    )
+export function calcBaseApr(totalStaked: number): number {
+  if (!Number.isFinite(totalStaked) || totalStaked < APR.MIN_STAKE) return 0
+  const x = clamp(totalStaked, APR.MIN_STAKE, APR.BASE_STAKE_CAP)
+  const t = (x - APR.MIN_STAKE) / (APR.BASE_STAKE_CAP - APR.MIN_STAKE) // 0..1
+  // Slightly eased (still monotonic) so early stake gains feel meaningful:
+  const eased = Math.sqrt(t)
+  return clamp(eased * APR.BASE_MAX, 0, APR.BASE_MAX)
+}
+
+/**
+ * Streak bonus (simple + explainable + capped):
+ * 1 day: +1
+ * 7 days: +2
+ * 14 days: +4
+ * 30 days: +10
+ */
+export function calcStreakBonus(dailyStreak: number): number {
+  if (!Number.isFinite(dailyStreak) || dailyStreak <= 0) return 0
+  if (dailyStreak >= 30) return 10
+  if (dailyStreak >= 14) return 4
+  if (dailyStreak >= 7) return 2
+  return 1
+}
+
+/**
+ * Level bonus: linear 0..20 (level 20 -> +20)
+ * If your DB already stores "level_bonus" directly, pass that instead.
+ */
+export function calcLevelBonus(level: number): number {
+  if (!Number.isFinite(level) || level <= 0) return 0
+  // treat level 20 as max
+  return clamp((level / 20) * APR.LEVEL_MAX, 0, APR.LEVEL_MAX)
+}
+
+export function calcApr(params: {
+  totalStaked: number
+  hasNft: boolean
+  boostActive: boolean
+  level: number
+  dailyStreak: number
+}): AprResult {
+  const staked = Number.isFinite(params.totalStaked) ? params.totalStaked : 0
+
+  // ✅ HARD RULE: if not staked (below MIN_STAKE), no APR at all
+  if (staked < APR.MIN_STAKE) {
     return {
-      updatedStakes: stakes,
-      totalNewlyAccrued: 0,
-      totalUnclaimedAll: totalUnclaimed,
+      totalApr: 0,
+      components: { base: 0, nft: 0, boost: 0, level: 0, streak: 0 },
     }
   }
 
-  const nowMs = now.getTime()
-  const yearlyAprFraction = aprTotal / 100
-  const dailyAprFraction = yearlyAprFraction / 365
+  const base = calcBaseApr(staked)
+  const nft = params.hasNft ? APR.NFT_MAX : 0
+  const boost = params.boostActive ? APR.BOOST_MAX : 0
+  const level = calcLevelBonus(params.level)
+  const streak = calcStreakBonus(params.dailyStreak)
 
-  let totalNewlyAccrued = 0
-
-  const updatedStakes = stakes.map((stake) => {
-    const currentUnclaimed = stake.unclaimed_reward ?? 0
-
-    // فقط استیک‌های active پاداش می‌گیرند
-    if (stake.status !== 'active') {
-      return {
-        ...stake,
-        unclaimed_reward: currentUnclaimed,
-      }
-    }
-
-    const lastTimestampStr = stake.last_reward_at || stake.started_at
-    const lastMs = new Date(lastTimestampStr).getTime()
-
-    if (!Number.isFinite(lastMs) || lastMs >= nowMs) {
-      return {
-        ...stake,
-        unclaimed_reward: currentUnclaimed,
-      }
-    }
-
-    const daysDiff = (nowMs - lastMs) / (1000 * 60 * 60 * 24)
-
-    if (daysDiff <= 0) {
-      return {
-        ...stake,
-        unclaimed_reward: currentUnclaimed,
-      }
-    }
-
-    const amount = stake.staked_amount || 0
-    if (!amount || amount <= 0) {
-      return {
-        ...stake,
-        unclaimed_reward: currentUnclaimed,
-      }
-    }
-
-    const newRewards = amount * dailyAprFraction * daysDiff
-    if (!Number.isFinite(newRewards) || newRewards <= 0) {
-      return {
-        ...stake,
-        unclaimed_reward: currentUnclaimed,
-      }
-    }
-
-    const newUnclaimed = currentUnclaimed + newRewards
-    totalNewlyAccrued += newRewards
-
-    return {
-      ...stake,
-      unclaimed_reward: newUnclaimed,
-      last_reward_at: now.toISOString(),
-    }
-  })
-
-  const totalUnclaimedAll = updatedStakes.reduce(
-    (sum, s) => sum + (s.unclaimed_reward ?? 0),
-    0
-  )
+  const totalApr = clamp(base + nft + boost + level + streak, 0, APR.TOTAL_MAX)
 
   return {
-    updatedStakes,
-    totalNewlyAccrued,
-    totalUnclaimedAll,
+    totalApr,
+    components: { base, nft, boost, level, streak },
   }
 }
