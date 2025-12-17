@@ -45,3 +45,4 @@ _backup_fix_*/
 backup.sh
 *.zip
 public/badges/
+backups/
