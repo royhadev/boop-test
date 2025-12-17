@@ -1,107 +1,62 @@
-import { NextResponse } from "next/server"
-import { supabaseAdmin } from "../../../../lib/supabaseAdmin"
+// app/api/reward/withdraw/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { supabaseAdmin } from "@/lib/supabaseAdmin";
 
-const WITHDRAW_FEE_PERCENT = 2 // 2%
+function toNum(v: any, d = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+}
 
-export async function POST(req: Request) {
+const WITHDRAW_FEE_PCT = 0.01; // ✅ 1% withdraw fee
+
+export async function POST(req: NextRequest) {
   try {
-    const { fid } = await req.json()
+    const body = await req.json().catch(() => ({}));
+    const fid = Number(body?.fid || 0);
+    if (!fid) return NextResponse.json({ ok: false, error: "Missing fid" }, { status: 400 });
 
-    if (!fid) {
-      return NextResponse.json({ error: "fid is required" }, { status: 400 })
-    }
-
-    // 1) گرفتن user
-    const { data: userRows, error: userErr } = await supabaseAdmin
+    const { data: user, error: uErr } = await supabaseAdmin
       .from("users")
-      .select("*")
+      .select("id, fid, withdrawable_rewards, withdrawable_balance")
       .eq("fid", fid)
-      .limit(1)
+      .single();
 
-    if (userErr) {
-      console.error("reward/withdraw: user query error", userErr)
-      return NextResponse.json({ error: "Failed to load user" }, { status: 500 })
+    if (uErr || !user) return NextResponse.json({ ok: false, error: "User not found" }, { status: 404 });
+
+    const gross = toNum(user.withdrawable_rewards, 0);
+    if (gross <= 0) {
+      return NextResponse.json({ ok: false, error: "Nothing to withdraw" }, { status: 400 });
     }
 
-    if (!userRows || userRows.length === 0) {
-      return NextResponse.json({ error: "User not found" }, { status: 404 })
-    }
+    const fee = gross * WITHDRAW_FEE_PCT;
+    const net = Math.max(0, gross - fee);
 
-    const user = userRows[0]
+    const oldBal = toNum(user.withdrawable_balance, 0);
+    const newBal = oldBal + net;
 
-    // 2) گرفتن همه‌ی پوزیشن‌های کاربر
-    const { data: stakesRows, error: stakesErr } = await supabaseAdmin
-      .from("stakes")
-      .select("id, staked_amount, unclaimed_reward, status")
-      .eq("user_id", user.id)
-      .neq("status", "withdrawn")
-
-    if (stakesErr) {
-      console.error("reward/withdraw: stakes query error", stakesErr)
-      return NextResponse.json({ error: "Failed to load stakes" }, { status: 500 })
-    }
-
-    const stakes = stakesRows || []
-
-    if (stakes.length === 0) {
-      return NextResponse.json(
-        { error: "No active stakes found for user" },
-        { status: 400 }
-      )
-    }
-
-    // 3) مجموع unclaimed_reward
-    const totalReward = stakes.reduce(
-      (sum: number, s: any) => sum + (s.unclaimed_reward || 0),
-      0
-    )
-
-    if (totalReward <= 0) {
-      return NextResponse.json(
-        { error: "No rewards to withdraw" },
-        { status: 400 }
-      )
-    }
-
-    const feePercent = WITHDRAW_FEE_PERCENT
-    const feeAmount = (totalReward * feePercent) / 100
-    const netReward = totalReward - feeAmount
-
-    const nowIso = new Date().toISOString()
-
-    // 4) صفر کردن unclaimed_reward تمام پوزیشن‌ها
-    const { error: updateErr } = await supabaseAdmin
-      .from("stakes")
+    const { error: upErr } = await supabaseAdmin
+      .from("users")
       .update({
-        unclaimed_reward: 0,
-        last_reward_at: nowIso,
+        withdrawable_rewards: 0,
+        withdrawable_balance: newBal,
       })
-      .eq("user_id", user.id)
-      .neq("status", "withdrawn")
+      .eq("id", user.id);
 
-    if (updateErr) {
-      console.error("reward/withdraw: update stakes error", updateErr)
-      return NextResponse.json(
-        { error: "Failed to reset rewards after withdraw" },
-        { status: 500 }
-      )
-    }
-
-    // TODO: نسخه on-chain:
-    // netReward را به کیف پول کاربر بفرستیم
+    if (upErr) return NextResponse.json({ ok: false, error: upErr.message }, { status: 500 });
 
     return NextResponse.json({
-      success: true,
-      withdrawnReward: netReward,
-      grossReward: totalReward,
-      feePercent,
-      feeAmount,
-    })
-  } catch (e) {
-    console.error("reward/withdraw: unexpected error", e)
-    return NextResponse.json(
-      { error: "Internal server error", details: String((e as any)?.message || e) },
-      { status: 500 }
-    )
+      ok: true,
+      fid,
+
+      // ✅ برای سازگاری + شفافیت
+      withdrawn_gross: gross,
+      fee,
+      withdrawn: net, // (net received)
+
+      withdrawable_rewards: 0,
+      withdrawable_balance: newBal,
+    });
+  } catch (e: any) {
+    return NextResponse.json({ ok: false, error: e?.message || "Withdraw failed" }, { status: 500 });
   }
 }

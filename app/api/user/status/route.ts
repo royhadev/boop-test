@@ -1,137 +1,97 @@
+// app/api/user/status/route.ts
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
-import { calcApr } from "@/lib/rewardEngine";
+import { calcApr, calcScore } from "@/lib/rewardEngine";
 
-function num(x: any, d = 0) {
+function toNum(x: any, def = 0) {
   const n = Number(x);
-  return Number.isFinite(n) ? n : d;
-}
-
-function nowTs() {
-  return Date.now();
-}
-
-function boostWindow(row: any) {
-  const s = row?.started_at ?? row?.starts_at ?? null;
-  const e = row?.ends_at ?? row?.expires_at ?? null;
-  return { s, e };
-}
-
-function isBoostActive(row: any): boolean {
-  const { s, e } = boostWindow(row);
-  if (!s || !e) return false;
-  const st = new Date(s).getTime();
-  const en = new Date(e).getTime();
-  const t = nowTs();
-  return Number.isFinite(st) && Number.isFinite(en) && t >= st && t <= en;
+  return Number.isFinite(n) ? n : def;
 }
 
 export async function GET(req: Request) {
   try {
     const { searchParams } = new URL(req.url);
-    const fid = num(searchParams.get("fid"), 0);
-    if (!fid) {
-      return NextResponse.json({ error: "Invalid fid" }, { status: 400 });
-    }
+    const fid = toNum(searchParams.get("fid"), 0);
+    if (!fid) return NextResponse.json({ error: "Missing fid" }, { status: 400 });
 
-    // 1️⃣ user
-    const { data: user, error: userErr } = await supabaseAdmin
+    const { data: user, error: ue } = await supabaseAdmin
       .from("users")
-      .select("*")
+      .select("id,fid,username,pfp,xp,level,daily_streak,withdrawable_rewards")
       .eq("fid", fid)
-      .maybeSingle();
+      .single();
 
-    if (userErr || !user) {
-      return NextResponse.json(
-        { error: "User not found" },
-        { status: 404 }
-      );
-    }
+    if (ue || !user) return NextResponse.json({ error: "User not found" }, { status: 404 });
 
-    // 2️⃣ stakes
-    const { data: stakes } = await supabaseAdmin
+    const { data: stakes, error: se } = await supabaseAdmin
       .from("stakes")
-      .select("*")
-      .eq("fid", fid);
-
-    let totalStaked = 0;
-    for (const s of stakes ?? []) {
-      const amt =
-        num(s.amount, NaN) ??
-        num(s.staked_amount, NaN) ??
-        num(s.value, 0);
-
-      const status = (s.status ?? "").toString().toUpperCase();
-      if (["UNSTAKED", "WITHDRAWN", "CANCELLED"].includes(status)) continue;
-
-      totalStaked += amt;
-    }
-
-    // 3️⃣ boosts (REAL sync)
-    let boostActive = false;
-    let activeBoosts: any[] = [];
-
-    const { data: boosts } = await supabaseAdmin
-      .from("user_boosts")
-      .select("*")
+      .select("staked_amount,status")
       .eq("user_id", user.id);
 
-    if (boosts && boosts.length > 0) {
-      activeBoosts = boosts
-        .filter(isBoostActive)
-        .map((b) => ({
-          kind: b.kind ?? b.type ?? b.boost_type ?? "UNKNOWN",
-          started_at: b.started_at,
-          ends_at: b.ends_at,
-        }));
+    if (se) return NextResponse.json({ error: "Failed to load stakes" }, { status: 500 });
 
-      boostActive = activeBoosts.length > 0;
+    const activeStaked = (stakes || [])
+      .filter((s: any) => String(s.status || "").toLowerCase() === "active")
+      .reduce((sum: number, s: any) => sum + toNum(s.staked_amount, 0), 0);
+
+    const { data: nftRow } = await supabaseAdmin
+      .from("nft_ownership")
+      .select("id")
+      .eq("user_id", user.id)
+      .maybeSingle();
+
+    const hasNft = !!nftRow;
+
+    let boostActive = false;
+    try {
+      const { data: boosts } = await supabaseAdmin
+        .from("user_boosts")
+        .select("id,active,ends_at")
+        .eq("user_id", user.id);
+
+      const now = Date.now();
+      boostActive = (boosts || []).some((b: any) => {
+        const a = b?.active === true;
+        const end = b?.ends_at ? new Date(b.ends_at).getTime() : 0;
+        return a && (!end || end > now);
+      });
+    } catch {
+      boostActive = false;
     }
 
-    // 4️⃣ NFT (safe)
-    const { data: nfts } = await supabaseAdmin
-      .from("nft_ownership")
-      .select("*")
-      .eq("fid", fid);
-
-    const hasNft = Array.isArray(nfts) && nfts.length > 0;
-
-    // 5️⃣ APR
     const apr = calcApr({
-      totalStaked,
+      totalStaked: activeStaked,
       hasNft,
       boostActive,
-      level: num(user.level, 0),
-      dailyStreak: num(user.daily_streak, 0),
+      level: toNum(user.level, 1),
+      dailyStreak: toNum(user.daily_streak, 0),
     });
+
+    const xp = toNum(user.xp, 0);
+    const score = calcScore({ xp, totalStaked: activeStaked });
 
     return NextResponse.json({
       ok: true,
       fid,
       user: {
-        fid,
+        fid: user.fid,
         username: user.username,
-        pfp: user.pfp ?? null,
-        xp: num(user.xp, 0),
-        level: num(user.level, 0),
-        daily_streak: num(user.daily_streak, 0),
+        pfp: user.pfp,
+        xp,
+        level: toNum(user.level, 1),
+        daily_streak: toNum(user.daily_streak, 0),
+        score,
+        withdrawableRewards: toNum(user.withdrawable_rewards, 0),
       },
-      staking: {
-        totalStaked,
+      staking: { totalStaked: activeStaked },
+      nft: { hasNft },
+      boosts: { active: boostActive },
+      apr: {
+        totalApr: apr.totalApr,
+        components: apr.components,
+        raw: apr.raw,
       },
-      boosts: {
-        active: boostActive,
-        activeBoosts,
-      },
-      nft: {
-        hasNft,
-      },
-      apr,
     });
   } catch (e: any) {
-    return NextResponse.json(
-      { error: "Unexpected error", detail: e?.message ?? String(e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ error: e?.message || "Unexpected error" }, { status: 500 });
   }
 }

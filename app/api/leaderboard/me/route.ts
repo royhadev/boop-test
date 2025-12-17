@@ -1,133 +1,61 @@
 import { NextResponse } from "next/server";
 import { supabaseAdmin } from "@/lib/supabaseAdmin";
-import { getCache, setCache } from "@/lib/simpleCache";
-
-function n(x: any, d = 0) {
-  const v = Number(x);
-  return Number.isFinite(v) ? v : d;
-}
-
-function computeScore(xp: number, totalStaked: number) {
-  const stake = Math.max(0, n(totalStaked, 0));
-  const s = Math.log10(stake + 1) * 100;
-  return Math.round((n(xp, 0) + s) * 100) / 100;
-}
+import { computeScore } from "@/lib/rewardEngine";
 
 export async function GET(req: Request) {
   try {
-    const cacheKey = `leaderboard:me:${req.url}`;
-    const cached = getCache<any>(cacheKey);
-    if (cached) return NextResponse.json(cached);
-
     const { searchParams } = new URL(req.url);
-    const fid = n(searchParams.get("fid"), 0);
-
+    const fid = Number(searchParams.get("fid"));
     if (!fid) {
-      return NextResponse.json({ error: "fid is required" }, { status: 400 });
+      return NextResponse.json({ ok: false, error: "Missing fid" }, { status: 400 });
     }
 
-    // users
-    const { data: users, error: uErr } = await supabaseAdmin
+    // Load users
+    const { data: users } = await supabaseAdmin
       .from("users")
-      .select("*");
+      .select("id,fid,xp,level");
 
-    if (uErr || !users) {
-      return NextResponse.json(
-        { error: uErr?.message ?? "Failed to load users" },
-        { status: 500 }
-      );
-    }
+    if (!users) throw new Error("Failed to load users");
 
-    // stakes
-    const { data: stakes, error: sErr } = await supabaseAdmin
+    // Load stakes
+    const { data: stakes } = await supabaseAdmin
       .from("stakes")
-      .select("*");
+      .select("user_id,staked_amount,status");
 
-    if (sErr || !stakes) {
-      return NextResponse.json(
-        { error: sErr?.message ?? "Failed to load stakes" },
-        { status: 500 }
+    if (!stakes) throw new Error("Failed to load stakes");
+
+    // Aggregate active stakes
+    const stakeMap = new Map<string, number>();
+    for (const s of stakes) {
+      if ((s.status ?? "").toLowerCase() !== "active") continue;
+      stakeMap.set(
+        s.user_id,
+        (stakeMap.get(s.user_id) ?? 0) + Number(s.staked_amount || 0)
       );
     }
 
-    // aggregate
-    const stakeMap = new Map<number, number>();
-    for (const s of stakes) {
-      const f = n(s.fid, 0);
-      if (!f) continue;
+    // Build & sort rows EXACTLY like /leaderboard
+    const rows = users
+      .map(u => {
+        const totalStaked = stakeMap.get(u.id) ?? 0;
+        const xp = Number(u.xp || 0);
+        return {
+          fid: u.fid,
+          score: Math.round((xp + Math.log10(totalStaked + 1) * 100) * 100) / 100
+        };
+      })
+      .sort((a, b) => b.score - a.score);
 
-      const amt =
-        n(s.amount, NaN) ??
-        n(s.staked_amount, NaN) ??
-        n(s.value, 0);
+    const rank = rows.findIndex(r => r.fid === fid) + 1;
+    const me = rows.find(r => r.fid === fid);
 
-      const status = (s.status ?? "").toString().toUpperCase();
-      if (["UNSTAKED", "WITHDRAWN", "CANCELLED"].includes(status)) continue;
-
-      stakeMap.set(f, (stakeMap.get(f) ?? 0) + amt);
-    }
-
-    // rows
-    const rows = users.map((u: any) => {
-      const f = u.fid;
-      const totalStaked = stakeMap.get(f) ?? 0;
-      const xp = n(u.xp, 0);
-
-      return {
-        fid: f,
-        username: u.username ?? `fid:${f}`,
-        pfp: u.pfp ?? null,
-        xp,
-        level: n(u.level, 0),
-        daily_streak: n(u.daily_streak, 0),
-        totalStaked,
-        score: computeScore(xp, totalStaked),
-
-        // filled after sort:
-        rank: 0,
-        isTop10: false,
-        isStaker: totalStaked > 0,
-      };
-    });
-
-    // sort
-    rows.sort((a, b) => {
-      if (b.score !== a.score) return b.score - a.score;
-      return b.xp - a.xp;
-    });
-
-    // fill global ranks
-    for (let i = 0; i < rows.length; i++) {
-      rows[i].rank = i + 1;
-      rows[i].isTop10 = rows[i].rank <= 10;
-    }
-
-    const idx = rows.findIndex(r => r.fid === fid);
-    if (idx < 0) {
-      return NextResponse.json({ error: "User not found" }, { status: 404 });
-    }
-
-    const me = { ...rows[idx], isMe: true };
-    const neighbors = rows
-      .slice(Math.max(0, idx - 2), Math.min(rows.length, idx + 3))
-      .map(r => ({ ...r, isMe: r.fid === fid }));
-
-    const response = {
+    return NextResponse.json({
       ok: true,
-      fid,
-      myRank: me.rank,
-      myScore: me.score,
-      me,
-      neighbors,
-      formula: "score = xp + log10(totalStaked + 1) * 100",
-    };
+      myRank: rank > 0 ? rank : null,
+      myScore: me?.score ?? null
+    });
 
-    setCache(cacheKey, response, 30_000);
-    return NextResponse.json(response);
   } catch (e: any) {
-    return NextResponse.json(
-      { error: "Unexpected error", detail: e?.message ?? String(e) },
-      { status: 500 }
-    );
+    return NextResponse.json({ ok: false, error: e.message }, { status: 500 });
   }
 }

@@ -1,135 +1,225 @@
-import { NextResponse } from 'next/server'
-import { supabaseAdmin } from '../../../../lib/supabaseAdmin'
+// app/api/reward/claim/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { supabaseAdmin } from "@/lib/supabaseAdmin";
+import { calcApr, calcRewardDelta } from "@/lib/rewardEngine";
 
-const MIN_CLAIM_INTERVAL_HOURS = 22  // حداقل فاصله‌ی بین دو Claim
-const STREAK_RESET_HOURS = 48        // اگر بیشتر از این فاصله بشه، استریک می‌سوزه
+const DAILY_XP = 25;
+const CLAIM_FEE_PCT = 0.02;
+const DAY = 24 * 3600 * 1000;
 
-// مقدار XP برای هر Claim روزانه
-const BASE_XP_PER_CLAIM = 25
-const STREAK_XP_PER_DAY = 5
-const MAX_STREAK_BONUS_XP = 100
-
-function hoursDiff(a: Date, b: Date) {
-  return (a.getTime() - b.getTime()) / (1000 * 60 * 60)
+function toMs(v: any): number | null {
+  if (!v) return null;
+  const t = new Date(v).getTime();
+  return Number.isFinite(t) ? t : null;
 }
 
-// تبدیل XP به Level (اگر خواستی بعداً راحت می‌تونی عددها رو عوض کنی)
-function levelFromXp(xp: number): number {
-  if (xp >= 3000) return 5
-  if (xp >= 1800) return 4
-  if (xp >= 900) return 3
-  if (xp >= 300) return 2
-  return 1
+function toNum(v: any, d = 0) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
 }
 
-export async function POST(req: Request) {
+// Level 0..20 based on 5250 XP total
+function xpToLevel(xp: number) {
+  const XP_L20 = 5250;
+  const step = XP_L20 / 20; // 262.5
+  const lv = Math.floor(Math.max(0, xp) / step);
+  return Math.max(0, Math.min(20, lv));
+}
+
+export async function POST(req: NextRequest) {
   try {
-    const body = await req.json().catch(() => ({}))
-    const fid = typeof body.fid === 'number' ? body.fid : Number(body.fid)
+    const body = await req.json().catch(() => ({}));
+    const fid = Number(body?.fid || 0);
+    if (!fid) {
+      return NextResponse.json({ ok: false, error: "Missing fid" }, { status: 400 });
+    }
 
-    if (!fid || Number.isNaN(fid)) {
+    const now = new Date();
+    const nowMs = now.getTime();
+    const nowIso = now.toISOString();
+
+    // user
+    const { data: user, error: uErr } = await supabaseAdmin
+      .from("users")
+      .select("id, fid, xp, level, daily_streak, last_claimed_at, withdrawable_rewards")
+      .eq("fid", fid)
+      .single();
+
+    if (uErr || !user) {
+      return NextResponse.json({ ok: false, error: "User not found" }, { status: 404 });
+    }
+
+    // cooldown 24h
+    const lastClaimMs = toMs((user as any).last_claimed_at);
+    if (lastClaimMs && nowMs < lastClaimMs + DAY) {
+      const left = Math.max(0, Math.floor((lastClaimMs + DAY - nowMs) / 1000));
       return NextResponse.json(
-        { success: false, error: 'Missing or invalid fid' },
+        { ok: false, error: "Too early to claim", nextClaimInSeconds: left },
         { status: 400 }
-      )
+      );
     }
 
-    // فقط جدول users – اصلاً به stakes دست نمی‌زنیم
-    const { data: user, error: userErr } = await supabaseAdmin
-      .from('users')
-      .select('*')
-      .eq('fid', fid)
-      .single()
+    // stakes
+    const { data: stakes, error: sErr } = await supabaseAdmin
+      .from("stakes")
+      .select("id, staked_amount, status, started_at, last_reward_at, unclaimed_reward")
+      .eq("user_id", (user as any).id);
 
-    if (userErr || !user) {
-      return NextResponse.json(
-        { success: false, error: 'User not found' },
-        { status: 404 }
-      )
+    if (sErr) {
+      return NextResponse.json({ ok: false, error: sErr.message }, { status: 500 });
     }
 
-    const now = new Date()
-    const lastClaim = user.last_daily_claim
-      ? new Date(user.last_daily_claim)
-      : null
+    const all = Array.isArray(stakes) ? stakes : [];
+    const activeStakes = all.filter((x) => String((x as any).status || "").toLowerCase() === "active");
+    const totalStaked = activeStakes.reduce((a, b) => a + toNum((b as any).staked_amount, 0), 0);
 
-    let hoursSinceLast: number | null = null
-    if (lastClaim) {
-      hoursSinceLast = hoursDiff(now, lastClaim)
+    // nft
+    const { data: nftRows } = await supabaseAdmin
+      .from("nft_ownership")
+      .select("id")
+      .eq("user_id", (user as any).id)
+      .eq("active", true)
+      .limit(1);
+
+    const hasNft = Array.isArray(nftRows) && nftRows.length > 0;
+
+    // boost (minimal)
+    const { data: boostRows } = await supabaseAdmin
+      .from("user_boosts")
+      .select("id")
+      .eq("user_id", (user as any).id)
+      .eq("active", true)
+      .limit(1);
+
+    const boostActive = Array.isArray(boostRows) && boostRows.length > 0;
+
+    // APR based on total active staked
+    const apr = calcApr({
+      totalStaked,
+      hasNft,
+      boostActive,
+      level: toNum((user as any).level, 0),
+      dailyStreak: toNum((user as any).daily_streak, 0),
+    });
+
+    // compute gross:
+    // - for active: stored + delta
+    // - for non-active: ONLY stored
+    let gross = 0;
+
+    for (const st of all) {
+      const status = String((st as any).status || "").toLowerCase();
+      const stored = toNum((st as any).unclaimed_reward, 0);
+
+      if (status !== "active") {
+        gross += stored;
+        continue;
+      }
+
+      const stakedAmount = toNum((st as any).staked_amount, 0);
+      const fromMs = toMs((st as any).last_reward_at ?? (st as any).started_at) ?? nowMs;
+
+      const delta = calcRewardDelta({
+        stakedAmount,
+        aprPercent: (apr as any).totalApr,
+        fromMs,
+        toMs: nowMs,
+      });
+
+      gross += stored + delta;
     }
 
-    // اگر هنوز ۲۲ ساعت نشده، اجازه‌ی Claim نمی‌دهیم
-    if (hoursSinceLast !== null && hoursSinceLast < MIN_CLAIM_INTERVAL_HOURS) {
-      const nextClaimAt = new Date(
-        lastClaim!.getTime() + MIN_CLAIM_INTERVAL_HOURS * 60 * 60 * 1000
-      ).toISOString()
+    gross = Math.max(0, gross);
 
-      return NextResponse.json(
-        {
-          success: false,
-          error: 'Daily reward already claimed recently',
-          next_claim_at: nextClaimAt,
-        },
-        { status: 400 }
-      )
-    }
+    const fee = gross * CLAIM_FEE_PCT;
+    const net = Math.max(0, gross - fee);
 
-    // محاسبه‌ی استریک جدید
-    let newStreak = user.daily_streak ?? 0
-    if (!lastClaim || hoursSinceLast! > STREAK_RESET_HOURS) {
-      // استریک سوخته → دوباره از ۱ شروع می‌کنیم
-      newStreak = 1
+    // --- streak update ---
+    const oldStreak = toNum((user as any).daily_streak, 0);
+    let newStreak = 1;
+
+    if (!lastClaimMs) {
+      newStreak = 1;
     } else {
-      newStreak = newStreak + 1
+      const diff = nowMs - lastClaimMs;
+      newStreak = diff <= 2 * DAY ? oldStreak + 1 : 1;
     }
 
-    // XP امروز
-    const streakBonusXp = Math.min(
-      newStreak * STREAK_XP_PER_DAY,
-      MAX_STREAK_BONUS_XP
-    )
+    // --- xp + level ---
+    const oldXp = toNum((user as any).xp, 0);
+    const newXp = oldXp + DAILY_XP;
 
-    const gainedXp = BASE_XP_PER_CLAIM + streakBonusXp
-    const newXp = (user.xp ?? 0) + gainedXp
-    const newLevel = levelFromXp(newXp)
+    const computedLevel = xpToLevel(newXp);
+    const oldLevel = toNum((user as any).level, 0);
+    const newLevel = Math.max(oldLevel, computedLevel);
 
-    const { error: updateErr } = await supabaseAdmin
-      .from('users')
+    // --- reset ALL stake stored rewards to 0 ---
+    if (all.length > 0) {
+      const { error: upStErr } = await supabaseAdmin
+        .from("stakes")
+        .update({
+          unclaimed_reward: 0,
+          last_reward_at: nowIso,
+        })
+        .eq("user_id", (user as any).id);
+
+      if (upStErr) {
+        return NextResponse.json({ ok: false, error: upStErr.message }, { status: 500 });
+      }
+    }
+
+    // --- update user withdrawable + streak/xp/level + last_claimed_at ---
+    const newWithdrawable = toNum((user as any).withdrawable_rewards, 0) + net;
+
+    const { error: upUErr } = await supabaseAdmin
+      .from("users")
       .update({
+        last_claimed_at: nowIso,
+        // legacy sync (do not remove)
+        last_daily_claim: nowIso,
+        daily_streak: newStreak,
         xp: newXp,
         level: newLevel,
-        daily_streak: newStreak,
-        last_daily_claim: now.toISOString(),
-        updated_at: now.toISOString(),
+        withdrawable_rewards: newWithdrawable,
       })
-      .eq('id', user.id)
+      .eq("fid", fid);
 
-    if (updateErr) {
-      console.error('Failed to update user on claim:', updateErr)
-      return NextResponse.json(
-        { success: false, error: 'Failed to update user' },
-        { status: 500 }
-      )
+    if (upUErr) {
+      return NextResponse.json({ ok: false, error: upUErr.message }, { status: 500 });
     }
 
-    const nextClaimAt = new Date(
-      now.getTime() + MIN_CLAIM_INTERVAL_HOURS * 60 * 60 * 1000
-    ).toISOString()
+    // ✅ NEW: write monthly XP log (so monthly leaderboard works)
+    // فقط ستون‌های مطمئن: user_id, amount, created_at
+    try {
+      const { error: xpErr } = await supabaseAdmin.from("xp_logs").insert({
+        user_id: (user as any).id,
+        amount: DAILY_XP,
+        created_at: nowIso,
+      });
+      // اگر اسکیمای xp_logs فرق داشت، claim رو fail نکنیم
+      if (xpErr) {
+        // eslint-disable-next-line no-console
+        console.warn("xp_logs insert failed:", xpErr.message);
+      }
+    } catch {
+      // ignore
+    }
 
     return NextResponse.json({
-      success: true,
+      ok: true,
       fid,
-      gained_xp: gainedXp,
-      new_xp: newXp,
-      new_level: newLevel,
-      new_streak: newStreak,
-      next_claim_at: nextClaimAt,
-    })
+      gross,
+      fee,
+      net,
+      withdrawable_rewards: newWithdrawable,
+      dailyStreak: newStreak,
+      xp: newXp,
+      level: newLevel,
+      lastClaimAt: nowIso,
+      nextClaimInSeconds: 24 * 60 * 60,
+      apr,
+    });
   } catch (e: any) {
-    console.error('Reward claim error:', e)
-    return NextResponse.json(
-      { success: false, error: 'Internal server error' },
-      { status: 500 }
-    )
+    return NextResponse.json({ ok: false, error: e?.message || "Claim failed" }, { status: 500 });
   }
 }

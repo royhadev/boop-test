@@ -1,113 +1,191 @@
 // lib/rewardEngine.ts
-// Server-side reward + APR helper (single source of truth).
-// Decisions enforced:
-// - Base APR max = 60%
-// - Base APR reaches 60% at 2,500,000 BOOP staked (cap)
-// - NFT bonus max = +20%
-// - Boost bonus max = +20%
-// - Level bonus max = +20%
-// - Streak bonus max = +10%
-// - Total APR clamp to 130%
-//
-// Extra rule (IMPORTANT):
-// - If user stake < MIN_STAKE, total APR must be 0 (no level/streak/nft/boost bonuses)
-//   because bonuses only apply to stakers.
 
-export type AprComponents = {
-  base: number
-  nft: number
-  boost: number
-  level: number
-  streak: number
-}
+export type BoostKind = "BOOST_24H" | "BOOST_72H" | "BOOST_7D" | "SUPERBOOST" | "UNKNOWN";
 
-export type AprResult = {
-  totalApr: number
-  components: AprComponents
-}
-
-export const APR = {
-  MIN_STAKE: 1_000,
-  BASE_MAX: 60,
-  BASE_STAKE_CAP: 2_500_000,
+const APR = {
+  MIN_STAKE: 1_000,              // زیر این = 0%
+  BASE_MAX: 60,                  // سقف base
+  BASE_STAKE_CAP: 2_500_000,     // طبق تصمیم پروژه (برای رسیدن به 60%)
+  STREAK_MAX: 10,
+  LEVEL_MAX: 20,
   NFT_MAX: 20,
   BOOST_MAX: 20,
-  LEVEL_MAX: 20,
-  STREAK_MAX: 10,
   TOTAL_MAX: 130,
-} as const
 
-function clamp(n: number, min: number, max: number) {
-  return Math.max(min, Math.min(max, n))
+  NFT_MIN_STAKE: 3_500_000,      // شرط فعال شدن NFT Boost
+};
+
+function clamp(n: number, a: number, b: number) {
+  return Math.max(a, Math.min(b, n));
 }
 
 /**
- * Monotonic base APR curve:
- * - 0% at MIN_STAKE
- * - 60% at BASE_STAKE_CAP
- * - never decreases when stake increases
+ * Base APR curve:
+ * base = K * log10(stake)
+ * K = 60 / log10(2,500,000)
+ * clamp 0..60
  */
-export function calcBaseApr(totalStaked: number): number {
-  if (!Number.isFinite(totalStaked) || totalStaked < APR.MIN_STAKE) return 0
-  const x = clamp(totalStaked, APR.MIN_STAKE, APR.BASE_STAKE_CAP)
-  const t = (x - APR.MIN_STAKE) / (APR.BASE_STAKE_CAP - APR.MIN_STAKE) // 0..1
-  // Slightly eased (still monotonic) so early stake gains feel meaningful:
-  const eased = Math.sqrt(t)
-  return clamp(eased * APR.BASE_MAX, 0, APR.BASE_MAX)
+export function calcBaseApr(stakeAmount: number): number {
+  const stake = Number(stakeAmount);
+  if (!Number.isFinite(stake) || stake < APR.MIN_STAKE) return 0;
+
+  const x = Math.max(stake, APR.MIN_STAKE);
+  const K = APR.BASE_MAX / Math.log10(APR.BASE_STAKE_CAP);
+  const raw = K * Math.log10(x);
+
+  return Number(clamp(raw, 0, APR.BASE_MAX).toFixed(2));
 }
 
 /**
- * Streak bonus (simple + explainable + capped):
- * 1 day: +1
- * 7 days: +2
- * 14 days: +4
- * 30 days: +10
+ * Streak bonus (capped 10)
  */
 export function calcStreakBonus(dailyStreak: number): number {
-  if (!Number.isFinite(dailyStreak) || dailyStreak <= 0) return 0
-  if (dailyStreak >= 30) return 10
-  if (dailyStreak >= 14) return 4
-  if (dailyStreak >= 7) return 2
-  return 1
+  const s = Number(dailyStreak);
+  if (!Number.isFinite(s) || s <= 0) return 0;
+  if (s >= 30) return 10;
+  if (s >= 14) return 4;
+  if (s >= 7) return 2;
+  return 1;
 }
 
 /**
- * Level bonus: linear 0..20 (level 20 -> +20)
- * If your DB already stores "level_bonus" directly, pass that instead.
+ * Level bonus: level 20 => +20
  */
 export function calcLevelBonus(level: number): number {
-  if (!Number.isFinite(level) || level <= 0) return 0
-  // treat level 20 as max
-  return clamp((level / 20) * APR.LEVEL_MAX, 0, APR.LEVEL_MAX)
+  const lv = Number(level);
+  if (!Number.isFinite(lv) || lv <= 0) return 0;
+  return Number(clamp((Math.min(lv, 20) / 20) * APR.LEVEL_MAX, 0, APR.LEVEL_MAX).toFixed(2));
 }
 
-export function calcApr(params: {
-  totalStaked: number
-  hasNft: boolean
-  boostActive: boolean
-  level: number
-  dailyStreak: number
-}): AprResult {
-  const staked = Number.isFinite(params.totalStaked) ? params.totalStaked : 0
+export type AprComponents = {
+  base: number;
+  nft: number;
+  boost: number;
+  level: number;
+  streak: number;
+};
 
-  // ✅ HARD RULE: if not staked (below MIN_STAKE), no APR at all
-  if (staked < APR.MIN_STAKE) {
+export type AprResult = {
+  // ✅ برای user/status و UI
+  totalApr: number;
+  components: AprComponents;
+
+  // ✅ برای reward/status و reward/claim (این routeها apr.total می‌خوان)
+  total: number;
+
+  // برای debug/سازگاری
+  raw: {
+    base: number;
+    nft: number;
+    boost: number;
+    level: number;
+    streak: number;
+    total: number;
+  };
+};
+
+/**
+ * calcApr supports BOTH styles:
+ * - calcApr({ totalStaked, hasNft, boostActive, level, dailyStreak })
+ * - calcApr({ baseApr, totalStaked, hasNft, boostActive, level, dailyStreak })
+ */
+export function calcApr(params: {
+  totalStaked: number;
+  baseApr?: number;
+  hasNft: boolean;
+  boostActive: boolean;
+  level: number;
+  dailyStreak: number;
+}): AprResult {
+  const staked = Number(params.totalStaked);
+  if (!Number.isFinite(staked) || staked < APR.MIN_STAKE) {
     return {
       totalApr: 0,
+      total: 0,
       components: { base: 0, nft: 0, boost: 0, level: 0, streak: 0 },
-    }
+      raw: { base: 0, nft: 0, boost: 0, level: 0, streak: 0, total: 0 },
+    };
   }
 
-  const base = calcBaseApr(staked)
-  const nft = params.hasNft ? APR.NFT_MAX : 0
-  const boost = params.boostActive ? APR.BOOST_MAX : 0
-  const level = calcLevelBonus(params.level)
-  const streak = calcStreakBonus(params.dailyStreak)
+  // اگر stake/create apr_base ذخیره کرده بود و می‌خوای همونو مبنا بگیری:
+  const baseAprFromDB = Number(params.baseApr ?? 0);
+  const base = baseAprFromDB > 0 ? clamp(baseAprFromDB, 0, APR.BASE_MAX) : calcBaseApr(staked);
 
-  const totalApr = clamp(base + nft + boost + level + streak, 0, APR.TOTAL_MAX)
+  const nftActive = !!params.hasNft && staked >= APR.NFT_MIN_STAKE;
+  const nft = nftActive ? APR.NFT_MAX : 0;
+
+  const boost = params.boostActive ? APR.BOOST_MAX : 0;
+  const level = calcLevelBonus(params.level);
+  const streak = calcStreakBonus(params.dailyStreak);
+
+  const total = Number(clamp(base + nft + boost + level + streak, 0, APR.TOTAL_MAX).toFixed(2));
 
   return {
-    totalApr,
-    components: { base, nft, boost, level, streak },
+    totalApr: total,      // ✅ UI
+    total,               // ✅ reward routes
+    components: {
+      base: Number(base.toFixed(2)),
+      nft,
+      boost,
+      level: Number(level.toFixed(2)),
+      streak,
+    },
+    raw: { base, nft, boost, level, streak, total },
+  };
+}
+
+/**
+ * reward delta (BOOP):
+ * delta = staked * (apr%/100) * (dt / 365days)
+ */
+export function calcRewardDelta(params: {
+  stakedAmount: number;
+  aprPercent: number;
+  fromMs: number;
+  toMs: number;
+}): number {
+  const staked = Number(params.stakedAmount);
+  const apr = Number(params.aprPercent);
+  const from = Number(params.fromMs);
+  const to = Number(params.toMs);
+
+  if (!Number.isFinite(staked) || staked <= 0) return 0;
+  if (!Number.isFinite(apr) || apr <= 0) return 0;
+  if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return 0;
+
+  const dtSec = (to - from) / 1000;
+  const yearSec = 365 * 24 * 3600;
+
+  const delta = staked * (apr / 100) * (dtSec / yearSec);
+  if (!Number.isFinite(delta)) return 0;
+
+  // دقت بالا برای UI
+  return Number(delta.toFixed(8));
+}
+
+/**
+ * Score formula (طبق تصمیم):
+ * score = xp + log10(totalStaked + 1) * 100
+ * (rounded down)
+ */
+export function calcScore(
+  a: number | { xp: number; totalStaked: number },
+  b?: number
+): number {
+  let xp = 0;
+  let totalStaked = 0;
+
+  if (typeof a === "object") {
+    xp = Number(a.xp || 0);
+    totalStaked = Number(a.totalStaked || 0);
+  } else {
+    xp = Number(a || 0);
+    totalStaked = Number(b || 0);
   }
+
+  if (!Number.isFinite(xp)) xp = 0;
+  if (!Number.isFinite(totalStaked) || totalStaked < 0) totalStaked = 0;
+
+  const stakePart = Math.log10(totalStaked + 1) * 100;
+  return Math.floor(xp + stakePart);
 }
