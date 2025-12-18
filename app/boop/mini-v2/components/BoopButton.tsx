@@ -1,90 +1,76 @@
 "use client";
 
-import React from "react";
+import React, { useEffect, useMemo, useState } from "react";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
 
-type BoopButtonVariant = "gold" | "goldOutline" | "dark";
-
-type Props = {
-  children: React.ReactNode;
-  onClick?: React.MouseEventHandler<HTMLButtonElement>;
-  disabled?: boolean;
-  className?: string;
-  variant?: BoopButtonVariant;
-  type?: "button" | "submit" | "reset";
+type Tab = {
+  href: string;
+  label: string;
+  icon?: React.ReactNode;
 };
 
-const base =
-  "w-full select-none rounded-xl px-4 py-3 text-sm font-semibold transition-all duration-150 active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed";
+const TABS: Tab[] = [
+  { href: "/boop/mini-v2", label: "Home" },
+  { href: "/boop/mini-v2/stake", label: "Stake" },
+  { href: "/boop/mini-v2/boost", label: "Boost" },
+  { href: "/boop/mini-v2/leaderboard", label: "Rank" },
+];
 
-const styles: Record<BoopButtonVariant, { className: string; style?: React.CSSProperties }> = {
-  gold: {
-    className: `${base} text-[#1A1A1A]`,
-    style: {
-      background:
-        "linear-gradient(180deg, #FFD76A 0%, #FFB800 45%, #E09A00 72%, #B87300 100%)",
-      border: "1px solid rgba(255, 215, 120, 0.60)",
-      boxShadow:
-        "inset 0 1px 0 rgba(255,255,255,0.45), inset 0 -2px 4px rgba(120,70,0,0.55), 0 0 34px rgba(255,180,0,0.78)",
-    },
-  },
+function getFidFromUrl(): number {
+  if (typeof window === "undefined") return 0;
+  try {
+    const u = new URL(window.location.href);
+    return Number(u.searchParams.get("fid") || 0);
+  } catch {
+    return 0;
+  }
+}
 
-  goldOutline: {
-    className: `${base} text-[#FFCF48]`,
-    style: {
-      background: "rgba(255, 184, 0, 0.06)",
-      border: "1px solid rgba(255, 184, 0, 0.55)",
-      boxShadow: "0 0 24px rgba(255,180,0,0.25)",
-    },
-  },
+function withFid(href: string, fid: number) {
+  if (!fid) return href;
+  return `${href}?fid=${fid}`;
+}
 
-  dark: {
-    className: `${base} text-white`,
-    style: {
-      background: "rgba(255,255,255,0.06)",
-      border: "1px solid rgba(255,255,255,0.12)",
-      boxShadow: "0 0 18px rgba(0,0,0,0.35)",
-    },
-  },
-};
+export default function BottomTabs() {
+  const pathname = usePathname();
 
-export default function BoopButton({
-  children,
-  onClick,
-  disabled,
-  className = "",
-  variant = "gold",
-  type = "button",
-}: Props) {
-  // ✅ crash-proof: اگر جایی اشتباهاً variant نامعتبر پاس داده شد
-  const v = styles[variant] ?? styles.gold;
+  // ✅ بدون useSearchParams: fid بعد از mount از URL خوانده می‌شود
+  const [fid, setFid] = useState<number>(0);
 
-  const handleEnter: React.MouseEventHandler<HTMLButtonElement> = (e) => {
-    if (disabled) return;
-    if (variant !== "gold") return;
-    e.currentTarget.style.filter = "brightness(1.08)";
-    e.currentTarget.style.boxShadow =
-      "inset 0 1px 0 rgba(255,255,255,0.55), inset 0 -2px 4px rgba(120,70,0,0.55), 0 0 46px rgba(255,190,40,0.92)";
-  };
+  useEffect(() => {
+    setFid(getFidFromUrl());
+    // هر بار route عوض شد دوباره بخوان (برای وقتی کاربر بین تب‌ها می‌چرخه)
+  }, [pathname]);
 
-  const handleLeave: React.MouseEventHandler<HTMLButtonElement> = (e) => {
-    if (disabled) return;
-    if (variant !== "gold") return;
-    e.currentTarget.style.filter = "none";
-    e.currentTarget.style.boxShadow =
-      "inset 0 1px 0 rgba(255,255,255,0.45), inset 0 -2px 4px rgba(120,70,0,0.55), 0 0 34px rgba(255,180,0,0.78)";
-  };
+  const tabs = useMemo(() => {
+    return TABS.map((t) => ({
+      ...t,
+      hrefWithFid: withFid(t.href, fid),
+      isActive: pathname === t.href,
+    }));
+  }, [fid, pathname]);
 
   return (
-    <button
-      type={type}
-      onClick={onClick}
-      disabled={disabled}
-      className={`${v.className} ${className}`}
-      style={v.style}
-      onMouseEnter={handleEnter}
-      onMouseLeave={handleLeave}
-    >
-      {children}
-    </button>
+    <div className="fixed bottom-0 left-0 right-0 z-50">
+      <div className="mx-auto max-w-[520px] px-4 pb-4">
+        <div className="rounded-3xl border border-white/10 bg-black/60 backdrop-blur-md">
+          <div className="grid grid-cols-4">
+            {tabs.map((t) => (
+              <Link
+                key={t.href}
+                href={t.hrefWithFid}
+                className={[
+                  "py-3 text-center text-xs font-semibold transition",
+                  t.isActive ? "text-yellow-300" : "text-white/60 hover:text-white/80",
+                ].join(" ")}
+              >
+                {t.label}
+              </Link>
+            ))}
+          </div>
+        </div>
+      </div>
+    </div>
   );
 }
