@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { Suspense, useEffect, useMemo, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import GoldButton from "../components/GoldButton";
 
@@ -39,7 +39,47 @@ function fmt(n: number, d = 2) {
   return n.toLocaleString(undefined, { maximumFractionDigits: d });
 }
 
+/**
+ * ✅ Fix for Vercel/Next build:
+ * useSearchParams() must be wrapped in a Suspense boundary.
+ */
 export default function BoostPage() {
+  return (
+    <Suspense
+      fallback={
+        <div className="space-y-4">
+          <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-4">
+            <div className="flex items-center justify-between">
+              <div>
+                <div className="text-lg font-semibold">Boost & NFT</div>
+                <div className="text-xs text-white/60">Loading...</div>
+              </div>
+              <div className="text-xs text-white/50">Loading...</div>
+            </div>
+          </div>
+
+          <div className="rounded-3xl border border-white/10 bg-white/[0.04] p-4">
+            <div className="text-sm font-semibold">Your Status</div>
+            <div className="mt-3 grid grid-cols-2 gap-3">
+              <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+                <div className="text-xs text-white/60">Total APR</div>
+                <div className="mt-1 text-xl font-semibold">—</div>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
+                <div className="text-xs text-white/60">Total Staked</div>
+                <div className="mt-1 text-xl font-semibold">—</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      }
+    >
+      <BoostPageInner />
+    </Suspense>
+  );
+}
+
+function BoostPageInner() {
   const router = useRouter();
   const sp = useSearchParams();
   const fid = Number(sp.get("fid") || 0);
@@ -244,10 +284,7 @@ export default function BoostPage() {
                     </div>
 
                     <div className="w-[150px]">
-                      <GoldButton
-                        onClick={() => activateBoost(b.kind)}
-                        disabled={disabled || isActiveRow}
-                      >
+                      <GoldButton onClick={() => activateBoost(b.kind)} disabled={disabled || isActiveRow}>
                         {isActiveRow ? "Active" : busyKind === b.kind ? "..." : "Activate"}
                       </GoldButton>
                     </div>
