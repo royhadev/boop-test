@@ -189,3 +189,6 @@ export function calcScore(
   const stakePart = Math.log10(totalStaked + 1) * 100;
   return Math.floor(xp + stakePart);
 }
+
+// Alias for API routes expecting computeScore
+export const computeScore = calcScore;
