@@ -1,7 +1,7 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useState } from "react";
-import { useRouter, useSearchParams } from "next/navigation";
+import { useEffect, useMemo, useState } from "react";
+import { useRouter } from "next/navigation";
 import GoldButton from "../components/GoldButton";
 
 type RewardStatus = {
@@ -22,6 +22,7 @@ type RewardStatus = {
     totalApr: number;
     components: { base: number; level: number; streak: number; boost: number; nft: number };
   };
+  error?: string;
 };
 
 const NFT_USD_PRICE_MONTH1 = 100;
@@ -35,54 +36,22 @@ const BOOSTS = [
 ];
 
 function fmt(n: number, d = 2) {
-  if (!Number.isFinite(n)) return "0";
-  return n.toLocaleString(undefined, { maximumFractionDigits: d });
+  const x = Number(n);
+  if (!Number.isFinite(x)) return "0";
+  return x.toLocaleString(undefined, { maximumFractionDigits: d });
 }
 
-/**
- * ✅ Fix for Vercel/Next build:
- * useSearchParams() must be wrapped in a Suspense boundary.
- */
 export default function BoostPage() {
-  return (
-    <Suspense
-      fallback={
-        <div className="space-y-4">
-          <div className="rounded-3xl border border-white/10 bg-white/[0.03] p-4">
-            <div className="flex items-center justify-between">
-              <div>
-                <div className="text-lg font-semibold">Boost & NFT</div>
-                <div className="text-xs text-white/60">Loading...</div>
-              </div>
-              <div className="text-xs text-white/50">Loading...</div>
-            </div>
-          </div>
-
-          <div className="rounded-3xl border border-white/10 bg-white/[0.04] p-4">
-            <div className="text-sm font-semibold">Your Status</div>
-            <div className="mt-3 grid grid-cols-2 gap-3">
-              <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-                <div className="text-xs text-white/60">Total APR</div>
-                <div className="mt-1 text-xl font-semibold">—</div>
-              </div>
-              <div className="rounded-2xl border border-white/10 bg-black/20 p-3">
-                <div className="text-xs text-white/60">Total Staked</div>
-                <div className="mt-1 text-xl font-semibold">—</div>
-              </div>
-            </div>
-          </div>
-        </div>
-      }
-    >
-      <BoostPageInner />
-    </Suspense>
-  );
-}
-
-function BoostPageInner() {
   const router = useRouter();
-  const sp = useSearchParams();
-  const fid = Number(sp.get("fid") || 0);
+
+  // ✅ fid را فقط بعد از mount از URL می‌خوانیم (بدون useSearchParams)
+  const [fid, setFid] = useState<number>(0);
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const u = new URL(window.location.href);
+    setFid(Number(u.searchParams.get("fid") || 0));
+  }, []);
 
   const [loading, setLoading] = useState(true);
   const [busyKind, setBusyKind] = useState<string | null>(null);
@@ -91,17 +60,22 @@ function BoostPageInner() {
 
   const activeKind = useMemo(() => {
     if (!reward?.boostActive) return null;
-    const k = typeof window !== "undefined" ? window.localStorage.getItem("boop_active_boost_kind") : null;
-    return k;
+    if (typeof window === "undefined") return null;
+    return window.localStorage.getItem("boop_active_boost_kind");
   }, [reward?.boostActive]);
 
   async function load() {
+    if (!fid) return;
+
     try {
       setLoading(true);
       setErr(null);
-      const r = await fetch(`/api/reward/status?fid=${fid}`, { cache: "no-store" });
+
+      const r = await fetch(`/api/reward/status?fid=${fid}&ts=${Date.now()}`, { cache: "no-store" });
       const j = (await r.json()) as RewardStatus;
-      if (!j?.ok) throw new Error((j as any)?.error || "Failed to load reward status");
+
+      if (!r.ok || !j?.ok) throw new Error((j as any)?.error || "Failed to load reward status");
+
       setReward(j);
     } catch (e: any) {
       setErr(e?.message || "Load error");
@@ -119,6 +93,8 @@ function BoostPageInner() {
   }, [fid]);
 
   async function activateBoost(kind: string) {
+    if (!fid) return;
+
     try {
       setBusyKind(kind);
       setErr(null);
@@ -132,7 +108,9 @@ function BoostPageInner() {
       const j = await res.json();
       if (!res.ok || j?.error) throw new Error(j?.error || "Activate failed");
 
-      window.localStorage.setItem("boop_active_boost_kind", kind);
+      if (typeof window !== "undefined") {
+        window.localStorage.setItem("boop_active_boost_kind", kind);
+      }
 
       await load();
     } catch (e: any) {
@@ -143,6 +121,8 @@ function BoostPageInner() {
   }
 
   async function buyNft() {
+    if (!fid) return;
+
     try {
       setBusyKind("NFT");
       setErr(null);
@@ -157,7 +137,6 @@ function BoostPageInner() {
       if (!res.ok || j?.error) throw new Error(j?.error || "NFT request failed");
 
       await load();
-
       router.push(`/boop/mini-v2?fid=${fid}`);
     } catch (e: any) {
       setErr(e?.message || "NFT error");
@@ -168,7 +147,6 @@ function BoostPageInner() {
 
   const boostLocked = !!reward?.boostActive;
 
-  // ✅ مهم: مثل Home فقط محتوا برمی‌گردونیم (بدون max-w/bg wrapper)
   return (
     <div className="space-y-4">
       {/* Header */}
@@ -181,6 +159,12 @@ function BoostPageInner() {
           <div className="text-xs text-white/50">{loading ? "Loading..." : "Live"}</div>
         </div>
       </div>
+
+      {!fid ? (
+        <div className="rounded-3xl border border-yellow-500/40 bg-yellow-500/10 p-3 text-sm text-yellow-200">
+          Missing fid in URL. Open like: <span className="font-mono">/boop/mini-v2/boost?fid=123</span>
+        </div>
+      ) : null}
 
       {err ? (
         <div className="rounded-3xl border border-red-500/40 bg-red-500/10 p-3 text-sm text-red-200">
@@ -284,7 +268,7 @@ function BoostPageInner() {
                     </div>
 
                     <div className="w-[150px]">
-                      <GoldButton onClick={() => activateBoost(b.kind)} disabled={disabled || isActiveRow}>
+                      <GoldButton onClick={() => activateBoost(b.kind)} disabled={disabled || isActiveRow || !fid}>
                         {isActiveRow ? "Active" : busyKind === b.kind ? "..." : "Activate"}
                       </GoldButton>
                     </div>
@@ -319,7 +303,7 @@ function BoostPageInner() {
             </div>
 
             <div className="w-[190px]">
-              <GoldButton onClick={buyNft} disabled={!!reward?.nftActive || busyKind !== null}>
+              <GoldButton onClick={buyNft} disabled={!!reward?.nftActive || busyKind !== null || !fid}>
                 {reward?.nftActive ? "Owned" : busyKind === "NFT" ? "..." : "Buy NFT (Next Step)"}
               </GoldButton>
             </div>
