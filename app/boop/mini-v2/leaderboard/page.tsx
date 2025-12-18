@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import React, { Suspense, useEffect, useMemo, useState } from "react";
 import { useSearchParams } from "next/navigation";
 
 type LeaderRow = {
@@ -31,7 +31,19 @@ function fmtScore(n: number | null | undefined) {
   return n % 1 === 0 ? String(n) : n.toFixed(2);
 }
 
+/**
+ * ✅ Next.js fix:
+ * useSearchParams() must be inside a Suspense boundary.
+ */
 export default function LeaderboardPage() {
+  return (
+    <Suspense fallback={<div className="text-sm text-white/60 p-4">Loading…</div>}>
+      <LeaderboardInner />
+    </Suspense>
+  );
+}
+
+function LeaderboardInner() {
   const sp = useSearchParams();
   const fid = useMemo(() => Number(sp.get("fid") || 0), [sp]);
 
@@ -69,7 +81,10 @@ export default function LeaderboardPage() {
       const lbUrl = `/api/leaderboard?mode=${mode}&page=${p}&limit=${limit}&ts=${ts}`;
       const meUrl = `/api/leaderboard/me?fid=${fid}&ts=${ts}`;
 
-      const [lbRes, meRes] = await Promise.all([fetch(lbUrl, { cache: "no-store" }), fetch(meUrl, { cache: "no-store" })]);
+      const [lbRes, meRes] = await Promise.all([
+        fetch(lbUrl, { cache: "no-store" }),
+        fetch(meUrl, { cache: "no-store" }),
+      ]);
 
       const lbJson = await lbRes.json();
       const meJson = await meRes.json();
